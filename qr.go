@@ -1,48 +1,79 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	b64 "encoding/base64"
 	"flag"
 	"fmt"
 	"image"
-	"image/png"
+	"image/jpeg"
+	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
+	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
 )
 
-func generateqr(payload string) string {
+func generateqr(payload string, index int) string {
+	// https://github.com/skip2/go-qrcode
+	// The maximum capacity of a QR Code varies according to the content encoded
+	// and the error recovery level. The maximum capacity is 2,953 bytes, 4,296 alphanumeric
+	// characters, 7,089 numeric digits, or a combination of these.
 	var pic []byte
-	pic, _ = qrcode.Encode(payload, qrcode.Medium, 256)
+	pic, _ = qrcode.Encode(payload, qrcode.Highest, 400)
 	img, _, err := image.Decode(bytes.NewReader(pic))
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	out, _ := os.Create("./qr.png")
+	index++ // Let start index=1
+	var filename = strconv.Itoa(index) + ".jpg"
+	out, _ := os.Create(filename)
 
-	if err := png.Encode(out, img); err != nil {
+	if err := jpeg.Encode(out, img, &jpeg.Options{Quality: 80}); err != nil {
 		out.Close()
 		log.Fatal(err)
 	}
-	return "qr.png"
+	return filename
+}
+
+func chunkit(longString string, chunkSize int) []string {
+	slices := []string{}
+	lastIndex := 0
+	lastI := 0
+	for i := range longString {
+		if i-lastIndex > chunkSize {
+			slices = append(slices, longString[lastIndex:lastI])
+			lastIndex = lastI
+		}
+		lastI = i
+	}
+	// handle the leftovers at the end
+	if len(longString)-lastIndex > chunkSize {
+		slices = append(slices, longString[lastIndex:lastIndex+chunkSize], longString[lastIndex+chunkSize:])
+	} else {
+		slices = append(slices, longString[lastIndex:])
+	}
+	// for _, str := range slices {
+	// 	fmt.Printf("(%s...) len: %d\n", str[0:5], len(str))
+	// }
+	return slices
 }
 
 func encodepayload(payload string) string {
-	fmt.Println("[*] encodepayload", payload)
+	fmt.Println("[*] encodepayload")
 	sEnc := b64.StdEncoding.EncodeToString([]byte(payload))
-	fmt.Println(sEnc)
 	return sEnc
 }
 
 func openbrowser(filename string) {
 	var err error
-	fmt.Println("[*] Displaying picture")
+	fmt.Println("[*] Displaying picture", filename)
 	switch runtime.GOOS {
 	case "linux":
 		err = exec.Command("xdg-open", filename).Start()
@@ -56,7 +87,6 @@ func openbrowser(filename string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-
 }
 
 func main() {
@@ -68,21 +98,29 @@ func main() {
 		fmt.Println("[*] Server mode: ON")
 		return
 	}
-	stat, _ := os.Stdin.Stat()
-	if (stat.Mode() & os.ModeCharDevice) == 0 {
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			fmt.Println("[*] Client mode: ON")
-			encoded := encodepayload(scanner.Text())
-			png := generateqr(encoded)
-			openbrowser(png)
-		}
 
-		if err := scanner.Err(); err != nil {
-			log.Println(err)
-		}
-	} else {
-		fmt.Println("Missing data, please send some data via stdin.")
-		return
+	writeText, err := os.Open(os.DevNull)
+	if err != nil {
+		log.Fatalf("failed to open a null device: %s", err)
+	}
+	defer writeText.Close()
+	io.WriteString(writeText, "Write Text")
+
+	readText, err := ioutil.ReadAll(os.Stdin)
+	if err != nil {
+		log.Fatalf("failed to read stdin: %s", err)
+	}
+
+	if len(readText) == 0 {
+		log.Fatalf("No data read from stdin")
+	}
+
+	fmt.Println("[*] Client mode: ON")
+	encoded := encodepayload(bytes.NewBuffer(readText).String())
+	chunks := chunkit(encoded, 250)
+	fmt.Printf("[*] Payload is in %d chunks\n", len(chunks))
+	for i, chunk := range chunks {
+		openbrowser(generateqr(chunk, i))
+		time.Sleep(1 * time.Second)
 	}
 }
