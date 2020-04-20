@@ -170,46 +170,52 @@ func server() {
 func main() {
 	fmt.Println("-= goqrexfil =-")
 	isServer := flag.Bool("server", false, "server mode")
+	isClient := flag.Bool("client", false, "client mode")
 	flag.Parse()
 
 	// Server mode (retrieving data from video)
 	if *isServer {
 		fmt.Println("[*] Server mode: ON")
 		server()
-	}
+	} else if *isClient {
+		// Client mode (allowing video recording of QR codes)
+		fmt.Println("[*] Client mode: ON")
+		writeText, err := os.Open(os.DevNull)
+		if err != nil {
+			log.Fatalf("failed to open a null device: %s", err)
+		}
+		defer writeText.Close()
+		io.WriteString(writeText, "Write Text")
 
-	// Client mode (allowing video recording of QR codes)
-	fmt.Println("[*] Client mode: ON")
-	writeText, err := os.Open(os.DevNull)
-	if err != nil {
-		log.Fatalf("failed to open a null device: %s", err)
-	}
-	defer writeText.Close()
-	io.WriteString(writeText, "Write Text")
+		readText, err := ioutil.ReadAll(os.Stdin)
+		if err != nil {
+			log.Fatalf("failed to read stdin: %s", err)
+		}
+		if len(readText) == 0 {
+			log.Fatalf("No data read from stdin")
+		}
 
-	readText, err := ioutil.ReadAll(os.Stdin)
-	if err != nil {
-		log.Fatalf("failed to read stdin: %s", err)
-	}
-	if len(readText) == 0 {
-		log.Fatalf("No data read from stdin")
-	}
+		// Compress, encode, chunk in pieces and display
+		maxbytes := 500
+		compressed := smaz.Encode(nil, readText)
+		encoded := b64.StdEncoding.EncodeToString(compressed)
+		fmt.Printf("%s", encoded)
+		chunks := chunkit(encoded, maxbytes)
+		fmt.Printf("[*] Payload is in %d chunks, video recording time estimate: %s\n", len(chunks), timeStr(int(float64(len(chunks))*0.1)))
+		fmt.Println("\n\n---=== 5 seconds to use CTRL+C if you want to abort ===---")
+		time.Sleep(5 * time.Second)
 
-	// Compress, encode, chunk in pieces and display
-	maxbytes := 500
-	compressed := smaz.Encode(nil, readText)
-	encoded := b64.StdEncoding.EncodeToString(compressed)
-	fmt.Printf("%s", encoded)
-	chunks := chunkit(encoded, maxbytes)
-	fmt.Printf("[*] Payload is in %d chunks, video recording time estimate: %s\n", len(chunks), timeStr(int(float64(len(chunks))*0.1)))
-	fmt.Println("\n\n---=== 5 seconds to use CTRL+C if you want to abort ===---")
-	time.Sleep(5 * time.Second)
-
-	for _, chunk := range chunks {
-		// log.Println("[D] Generating qr #", i+1)
-		time.Sleep(100 * time.Millisecond)
-		CallClear()
-		RenderQR(chunk)
+		for _, chunk := range chunks {
+			// log.Println("[D] Generating qr #", i+1)
+			time.Sleep(100 * time.Millisecond)
+			CallClear()
+			RenderQR(chunk)
+		}
+	} else {
+		fmt.Println("\nPlease use client or server mode:\n")
+		fmt.Println("echo \"data to send\" | ./qr --client\t\tTo use in client mode")
+		fmt.Println("./qr --server\t\t\t\t\tTo use as a TLS listener to receive video and extract data")
+		fmt.Println()
+		os.Exit(1)
 	}
-
 }
