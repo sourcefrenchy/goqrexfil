@@ -136,34 +136,26 @@ func timeStr(sec int) (res string) {
 
 // upload will get a file and save it in ./Public
 // test: curl -F 'file=@./1.jpg' http://localhost:8888/upload
-func upload(c *gin.Context) {
-	file, header, err := c.Request.FormFile("file")
-	if err != nil {
-		c.String(http.StatusBadRequest, fmt.Sprintf("file err : %s", err.Error()))
-		return
-	}
-	filename := header.Filename
-	out, err := os.Create("public/" + filename)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer out.Close()
-	_, err = io.Copy(out, file)
-	if err != nil {
-		log.Fatal(err)
-	}
-	filepath := "http://localhost:8888/file/" + filename
-	c.JSON(http.StatusOK, gin.H{"filepath": filepath})
-}
-
 func server() {
 	router := gin.Default()
-	router.LoadHTMLGlob("template/*")
-	router.GET("/", func(c *gin.Context) {
-		c.HTML(http.StatusOK, "select_file.html", gin.H{})
+	// gin.SetMode(gin.ReleaseMode)
+
+	router.Static("/", "./public")
+	router.POST("/upload", func(c *gin.Context) {
+		// Source
+		file, err := c.FormFile("file")
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("get form err: %s", err.Error()))
+			return
+		}
+
+		// filename := filepath.Base(file.Filename)
+		if err := c.SaveUploadedFile(file, "./public/video.mp4"); err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("upload file err: %s", err.Error()))
+			return
+		}
+		c.String(http.StatusOK, fmt.Sprintf("File %s uploaded successfully for processing", file.Filename))
 	})
-	router.POST("/upload", upload)
-	router.StaticFS("/file", http.Dir("public"))
 	router.Run(":8888")
 }
 
@@ -212,7 +204,7 @@ func main() {
 			RenderQR(chunk)
 		}
 	} else {
-		fmt.Println("\nPlease use client or server mode:\n")
+		fmt.Println("Please use client or server mode:\n")
 		fmt.Println("echo \"data to send\" | ./qr --client\t\tTo use in client mode")
 		fmt.Println("./qr --server\t\t\t\t\tTo use as a TLS listener to receive video and extract data")
 		fmt.Println()
