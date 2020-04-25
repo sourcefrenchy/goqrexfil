@@ -167,7 +167,7 @@ func extractPayload(path string) string {
 func video2frames() {
 	cmd := exec.Command("/usr/local/bin/ffmpeg", "-i", "./public/video.mp4", "-r", "1", "./public/%03d.png")
 	cmd.Run()
-	fmt.Println("[*] frames extracted")
+	fmt.Println("[*] Frames extracted")
 }
 
 func processingonly() string {
@@ -191,8 +191,8 @@ func processingonly() string {
 // upload will get a file and save it in ./Public
 // test: curl -F 'file=@./1.jpg' http://localhost:8888/upload
 func server() {
+	gin.SetMode("release")
 	router := gin.Default()
-	gin.SetMode(gin.ReleaseMode)
 
 	router.Static("/", "./public")
 	router.POST("/upload", func(c *gin.Context) {
@@ -208,6 +208,7 @@ func server() {
 			c.String(http.StatusBadRequest, fmt.Sprintf("upload file err: %s", err.Error()))
 			return
 		}
+		log.Println("\n[*] File received")
 		c.String(http.StatusOK, fmt.Sprintf("File %s uploaded successfully for processing", file.Filename))
 		video2frames()
 		compressedPayload := processingonly()
@@ -216,7 +217,7 @@ func server() {
 		// fmt.Println("\n-> Encoded payload:", compressedPayload)
 		// fmt.Println("-> Decoded payload:", decoded)
 		// fmt.Println("-> Decompressed/Original payload:", decompressed)
-		writePayloadFile(decompressed, "file.output")
+		writePayloadFile(decompressed, "payload.raw")
 	})
 	router.Run(":8888")
 }
@@ -257,7 +258,7 @@ func main() {
 		// fmt.Println("\n-> Encoded payload:", compressedPayload)
 		// fmt.Println("-> Decoded payload:", decoded)
 		// fmt.Println("-> Decompressed/Original payload:", decompressed)
-		writePayloadFile(decompressed, "file.output")
+		writePayloadFile(decompressed, "payload.raw")
 
 	} else if *isServer {
 		// Server mode (retrieving data from video)
@@ -285,7 +286,7 @@ func main() {
 		maxbytes := 500
 		compressed := smaz.Encode(nil, readText)
 		encoded := b64.StdEncoding.EncodeToString(compressed)
-		fmt.Printf("%s", encoded)
+		// fmt.Printf("%s", encoded)
 		chunks := chunkit(encoded, maxbytes)
 		fmt.Printf("[*] Payload is in %d chunks, video recording time estimate: %s\n", len(chunks), timeStr(int(float64(len(chunks))*0.1)))
 		fmt.Println("\n\n---=== 5 seconds to use CTRL+C if you want to abort ===---")

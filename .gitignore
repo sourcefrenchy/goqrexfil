@@ -20,3 +20,6 @@ qr
 *.mp4
 file.output.pdf
 .DS_Store
+payload.raw
+file.output
+top.secret.file
