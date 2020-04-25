@@ -33,7 +33,8 @@ Start recording a video now, QR codes will be displayed on the console and stop 
 2. From your phone, go to your server domain/ip on port 8888 e.g. http://1.2.3.4:8888/ and upload the video:
 
 Example:
-```➜ ./goqrexfil -server
+```
+➜ ./goqrexfil -server
 -= goqrexfil =-
 [*] Server mode: ON
 2020/04/25 11:42:15
