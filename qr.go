@@ -1,20 +1,25 @@
 package main
 
 import (
+	"bytes"
 	b64 "encoding/base64"
 	"flag"
 	"fmt"
+	"image/png"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/kjk/smaz"
+	"github.com/liyue201/goqr"
 	"github.com/mattn/go-colorable"
 	"github.com/mdp/qrterminal"
 )
@@ -134,11 +139,60 @@ func timeStr(sec int) (res string) {
 	return
 }
 
+func extractPayload(path string) string {
+	imgdata, err := ioutil.ReadFile(path)
+	if err != nil {
+		fmt.Printf("%v\n", err)
+		return ""
+	}
+
+	img, err := png.Decode(bytes.NewReader(imgdata))
+	if err != nil {
+		// fmt.Printf("\nimage.Decode error: %v\n", err)
+		return ""
+	}
+	qrCodes, err := goqr.Recognize(img)
+	if err != nil {
+		// fmt.Printf("\nRecognize failed: %v\n", err)
+		return ""
+	}
+	for _, qrCode := range qrCodes {
+		// fmt.Printf("qrCode text: %s\n", qrCode.Payload)
+		fmt.Printf("\n%s has payload.. Adding", path)
+		return fmt.Sprintf("%s", qrCode.Payload)
+	}
+	return ""
+}
+
+func video2frames() {
+	cmd := exec.Command("/usr/local/bin/ffmpeg", "-i", "./public/video.mp4", "-r", "1", "./public/%03d.png")
+	cmd.Run()
+	fmt.Println("[*] frames extracted")
+}
+
+func processingonly() string {
+	matches, _ := filepath.Glob("./public/*.png")
+	var payload string
+	for _, match := range matches {
+		s := extractPayload(match)
+		if len(s) > 0 {
+			// in case two frames have same QR code and data
+			duplicate := strings.Contains(payload, s)
+			if duplicate == false {
+				payload += s
+			} else {
+				fmt.Printf("\n%s is duplicate.. Skipping", match)
+			}
+		}
+	}
+	return payload
+}
+
 // upload will get a file and save it in ./Public
 // test: curl -F 'file=@./1.jpg' http://localhost:8888/upload
 func server() {
 	router := gin.Default()
-	// gin.SetMode(gin.ReleaseMode)
+	gin.SetMode(gin.ReleaseMode)
 
 	router.Static("/", "./public")
 	router.POST("/upload", func(c *gin.Context) {
@@ -155,18 +209,58 @@ func server() {
 			return
 		}
 		c.String(http.StatusOK, fmt.Sprintf("File %s uploaded successfully for processing", file.Filename))
+		video2frames()
+		compressedPayload := processingonly()
+		decoded, _ := b64.StdEncoding.DecodeString(compressedPayload)
+		decompressed, _ := smaz.Decode(nil, decoded)
+		// fmt.Println("\n-> Encoded payload:", compressedPayload)
+		// fmt.Println("-> Decoded payload:", decoded)
+		// fmt.Println("-> Decompressed/Original payload:", decompressed)
+		writePayloadFile(decompressed, "file.output")
 	})
 	router.Run(":8888")
+}
+
+func writePayloadFile(payload []byte, filename string) {
+	// Open a new file for writing only
+	file, err := os.OpenFile(
+		filename,
+		os.O_WRONLY|os.O_TRUNC|os.O_CREATE,
+		0666,
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+
+	// Write bytes to file
+	bytesWritten, err := file.Write(payload)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("\n\n[*] Payload retrieved (Wrote %d bytes): %s.\n", bytesWritten, filename)
 }
 
 func main() {
 	fmt.Println("-= goqrexfil =-")
 	isServer := flag.Bool("server", false, "server mode")
 	isClient := flag.Bool("client", false, "client mode")
+	isProcessing := flag.Bool("processingonly", false, "processing existing video only (debug mode)")
 	flag.Parse()
 
-	// Server mode (retrieving data from video)
-	if *isServer {
+	if *isProcessing {
+		fmt.Println("[*] Processing only - DEBUG MODE")
+		video2frames()
+		compressedPayload := processingonly()
+		decoded, _ := b64.StdEncoding.DecodeString(compressedPayload)
+		decompressed, _ := smaz.Decode(nil, decoded)
+		// fmt.Println("\n-> Encoded payload:", compressedPayload)
+		// fmt.Println("-> Decoded payload:", decoded)
+		// fmt.Println("-> Decompressed/Original payload:", decompressed)
+		writePayloadFile(decompressed, "file.output")
+
+	} else if *isServer {
+		// Server mode (retrieving data from video)
 		fmt.Println("[*] Server mode: ON")
 		server()
 	} else if *isClient {
