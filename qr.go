@@ -7,7 +7,6 @@ import (
 	"image/png"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	log "github.com/sirupsen/logrus"
+
 	qrcodeTerminal "github.com/Baozisoftware/qrcode-terminal-go"
 	"github.com/gin-gonic/gin"
 	"github.com/kjk/smaz"
@@ -23,6 +24,9 @@ import (
 	"github.com/mdp/qrterminal"
 	"gopkg.in/bieber/barcode.v0"
 )
+
+// Environment will define the type of logging. Choices: *, production
+const Environment = "dev"
 
 var clear map[string]func() //create a map for storing clear funcs
 const video = "./public/video.mp4"
@@ -152,18 +156,22 @@ func extractPayload(path string) string {
 		return ""
 	}
 
-	fmt.Println("[D] decoding image...")
+	log.Infoln("Decoding image..")
 	src, _ := png.Decode(fi)
-	fmt.Println("[D] retrieving txt...")
+	log.Infoln("Retrieving payload..")
 
 	img := barcode.NewImage(src)
 	scanner := barcode.NewScanner().
 		SetEnabledAll(true)
 
 	symbols, _ := scanner.ScanImage(img)
+	type symbolsextended struct {
+		filename string
+	}
 	for _, s := range symbols {
 		// fmt.Println(s.Type.Name(), s.Data, s.Quality, s.Boundary)
-		fmt.Println(s.Type.Name(), s.Data)
+		filename := &symbolsextended{path}
+		log.Warnln(filename.filename, s.Type.Name(), s.Data)
 		retStr.WriteString(s.Data)
 	}
 
@@ -197,7 +205,7 @@ func retrievePayload() {
 			if duplicate == false {
 				payload += s
 			} else {
-				fmt.Printf("\n%s is duplicate.. Skipping", match)
+				log.Infof("\n%s is duplicate.. Skipping", match)
 			}
 		}
 	}
@@ -260,6 +268,16 @@ func writePayloadFile(payload []byte, filename string) {
 }
 
 func main() {
+	log.SetFormatter(&log.TextFormatter{
+		DisableColors: false,
+		FullTimestamp: true,
+	})
+	if Environment == "production" {
+		log.SetFormatter(&log.JSONFormatter{})
+	} else {
+		// The TextFormatter is default, you don't actually have to do this.
+		log.SetFormatter(&log.TextFormatter{})
+	}
 	fmt.Println("-= goqrexfil =-")
 	isServer := flag.Bool("server", false, "server mode")
 	isClient := flag.Bool("client", false, "client mode")
@@ -267,7 +285,7 @@ func main() {
 	flag.Parse()
 
 	if *isProcessing {
-		fmt.Println("[*] Processing only - DEBUG MODE")
+		log.Println("Processing only - DEBUG MODE")
 		splitIntoFrames()
 		retrievePayload()
 	} else if *isServer {
@@ -286,7 +304,7 @@ func main() {
 
 		readText, err := ioutil.ReadAll(os.Stdin)
 		if err != nil {
-			log.Fatalf("failed to read stdin: %s", err)
+			log.Fatalf("failed to open a null device: %s", err)
 		}
 		if len(readText) == 0 {
 			log.Fatalf("No data read from stdin")
