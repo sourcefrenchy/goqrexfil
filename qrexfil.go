@@ -31,7 +31,7 @@ import (
 const port = "9999"
 const video = "./public/video.mp4"
 const ffmpeg = "/opt/homebrew/bin/ffmpeg"
-const retrieved = "./payload/payload.raw"
+const retrieved = "./payload/payload.bin"
 const maxBytes = 260
 const startTimer = 3
 const msBetweenFrames = 400
@@ -77,7 +77,7 @@ func RenderQR(chunk string) string {
 	}
 	encodedString := base64.StdEncoding.EncodeToString(buff.Bytes())
 	h := blake2b.Sum512([]byte(encodedString))
-	log.Info("New encoded chunk hash ", hex.EncodeToString(h[:]))
+	log.Info("Checksum ", hex.EncodeToString(h[:]))
 	return "<img src=\"data:image/png;base64," + encodedString + "\" />"
 }
 
@@ -128,7 +128,7 @@ func retrievePayload() bool {
 	if err != nil {
 		panic(err)
 	}
-	log.Info("[*] Cleaning old files and extracting video frames")
+	fmt.Println("[***] Cleaning old files and extracting video frames")
 	for _, f := range files {
 		if err := os.Remove(f); err != nil {
 			panic(err)
@@ -142,14 +142,13 @@ func retrievePayload() bool {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Info("[*] Frames extracted")
 
 	// Now we need to parse all frames, find if a QR Code is present and extract data from it
 	var payload string
 	matches, _ := filepath.Glob("./public/*png")
-	log.Info("[*] Extracting data from ", len(matches), " frames, skipping duplicates")
+	fmt.Println("[***] Extracting data from ", len(matches), " frames, skipping duplicates")
 	for _, match := range matches {
-		fmt.Println("Decoding image from File ", match)
+		fmt.Println("[*] Retrieving image from file", match)
 		f, _ := os.Open(match)
 		img, _, _ := image.Decode(f)
 		err := f.Close()
@@ -158,22 +157,20 @@ func retrievePayload() bool {
 		}
 		buff := DecodeQRCode(img)
 		if len(buff) == 0 {
-			log.Info("Empty ... Skipping")
+			fmt.Println("\tEmpty ... Skipping")
 		} else {
 			result := buff
 			if len(result) > 0 {
-				log.Info("Found payload!")
 				// in case two frames have same QR code and data
 				duplicate := strings.Contains(payload, result)
 				if duplicate == false {
 					payload += result
 					h := blake2b.Sum512([]byte(payload))
-					log.Info("Payload retrieved hash ", hex.EncodeToString(h[:]))
+					fmt.Println("\tPayload retrieved hash ", hex.EncodeToString(h[:]))
 				}
 			}
 		}
 	}
-	log.Info("Finished retrieving all payload chunks, payload size ", len(payload))
 
 	var result = true
 	if len(payload) > 0 {
@@ -185,7 +182,7 @@ func retrievePayload() bool {
 			log.Fatal(err)
 		}
 		h := blake2b.Sum512(content)
-		log.Info("[*] Payload saved as ", retrieved, "\n   Blake2b 512:   ", hex.EncodeToString(h[:]))
+		fmt.Println("\n[*] Payload saved as ", retrieved, " ( Checksum", hex.EncodeToString(h[:]), ")")
 	} else {
 		log.Info("!!! No Payload retrieved from analyzed frames")
 		result = false
@@ -252,9 +249,9 @@ func server() {
 func writePayloadFile(payload []byte, filename string) {
 	err := os.Remove(filename)
 	if err != nil {
-		log.Println("No previous payload file found")
+		fmt.Println("\n[I] No previous payload file found")
 	} else {
-		log.Info("Deleted previous payload file")
+		fmt.Println("\n[I] Deleted previous payload file")
 	}
 	// Open a new file for writing only
 	file, err := os.OpenFile(
@@ -286,7 +283,6 @@ func main() {
 		FullTimestamp: true,
 	})
 	log.SetFormatter(&log.TextFormatter{})
-	fmt.Println("-= goqrexfil =-")
 	isServer := flag.Bool("server", false, "server mode")
 	isClient := flag.Bool("client", false, "client mode")
 	isProcessing := flag.Bool("retrievePayload", false, "processing existing video only (debug mode)")
