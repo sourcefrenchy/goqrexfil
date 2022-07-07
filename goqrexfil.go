@@ -34,7 +34,7 @@ const port = "9999"
 const video = "./public/video.mp4"
 const ffmpeg = "/opt/homebrew/bin/ffmpeg"
 const retrieved = "./payload/payload.bin"
-const maxBytes = 230
+const maxBytes = 325 // 230
 const startTimer = 3
 const msBetweenFrames = 500
 
@@ -71,7 +71,7 @@ func init() {
 // RenderQR returns a QR code string from a string
 func RenderQR(chunk string) string {
 	qrCode, _ := qr.Encode(chunk, qr.H, qr.Unicode)
-	qrCode, _ = barcode.Scale(qrCode, 480, 480)
+	qrCode, _ = barcode.Scale(qrCode, 600, 600)
 	var buff bytes.Buffer
 	err := png.Encode(&buff, qrCode)
 	if err != nil {
@@ -334,7 +334,7 @@ func main() {
 			</body>
 		</html>
 		`
-		ui, error := lorca.New("data:text/html,"+url.PathEscape(html), "", 600, 600)
+		ui, error := lorca.New("data:text/html,"+url.PathEscape(html), "", 675, 675)
 		if error != nil {
 			log.Fatal("lorca.New():", err)
 		}
