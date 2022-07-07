@@ -5,7 +5,7 @@ go 1.18
 require (
 	github.com/PeterCxy/gozbar v0.0.0-20190326032822-3a1847c06661
 	github.com/boombuler/barcode v1.0.1
-	github.com/gin-gonic/gin v1.7.7
+	github.com/gin-gonic/gin v1.8.1
 	github.com/julienroland/keyboard-termbox v0.0.0-20170507181043-8367444ed68b
 	github.com/kjk/smaz v0.0.0-20151202183815-c61c680e82ff
 	github.com/nsf/termbox-go v1.1.1
@@ -21,6 +21,7 @@ require (
 	gioui.org/shader v1.0.6 // indirect
 	github.com/andlabs/ui v0.0.0-20200610043537-70a69d6ae31e // indirect
 	github.com/benoitkugler/textlayout v0.1.0 // indirect
+	github.com/cespare/go-smaz v1.0.0 // indirect
 	github.com/chai2010/qrcode v0.0.0-20200331151617-105df13a15a3 // indirect
 	github.com/clsung/grcode v0.0.0-20181204013735-e7f3c16fb531 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
@@ -35,6 +36,7 @@ require (
 	github.com/go-playground/universal-translator v0.18.0 // indirect
 	github.com/go-playground/validator/v10 v10.11.0 // indirect
 	github.com/go-text/typesetting v0.0.0-20220411150340-35994bc27a7b // indirect
+	github.com/goccy/go-json v0.9.7 // indirect
 	github.com/godbus/dbus/v5 v5.0.4 // indirect
 	github.com/goki/freetype v0.0.0-20181231101311-fa8a33aabaff // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
@@ -49,12 +51,13 @@ require (
 	github.com/mattn/go-runewidth v0.0.13 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
+	github.com/pelletier/go-toml/v2 v2.0.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/pwaller/keyboard v0.0.0-20121011105959-f32bd761b121 // indirect
 	github.com/rivo/uniseg v0.2.0 // indirect
 	github.com/srwiley/oksvg v0.0.0-20200311192757-870daf9aa564 // indirect
 	github.com/srwiley/rasterx v0.0.0-20200120212402-85cb7272f5e9 // indirect
-	github.com/stretchr/testify v1.7.0 // indirect
+	github.com/stretchr/testify v1.7.1 // indirect
 	github.com/tuotoo/qrcode v0.0.0-20220425170535-52ccc2bebf5d // indirect
 	github.com/ugorji/go/codec v1.2.7 // indirect
 	github.com/yuin/goldmark v1.3.8 // indirect

