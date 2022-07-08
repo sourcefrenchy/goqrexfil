@@ -30,19 +30,20 @@ import (
 	"golang.org/x/crypto/blake2b"
 )
 
-const serverPort = "9999"
-const videoLocation = "./public/video.mp4" // location of video uploaded to the web service
-const ffmpeg = "/opt/homebrew/bin/ffmpeg"
-const ffmpegQuality = "15"              // 1-31, recommended 5 for great, 10 for acceptable (this helps reduce file size)
-const ffmpegImageScale = "scale=500:-1" // 500px + keep aspect ratio
-const retrieved = "./payload/payload.bin"
-const maxBytes = 325 // 230
-const startTimer = 3
-const msBetweenFrames = 500
-
-var clear map[string]func()
+const (
+	serverPort        = "9999"                     // TCP port to run the web service on
+	videoLocation     = "./public/video.mp4"       // location of video uploaded to the web service
+	ffmpeg            = "/opt/homebrew/bin/ffmpeg" // Path to local FFMPEG - required only for server mode
+	ffmpegQuality     = "15"                       // Qualify for frames to images conversion. 1-31. 5 for great, 10 for acceptable (this helps reduce file size)
+	ffmpegImageScale  = "scale=500:-1"             // Scale for frames to images conversion. 500px + keep aspect ratio
+	QRCDataMaxBytes   = 325                        // 230 was safe. If this gets too big, QR code will be hard to read...
+	secsBeforeDisplay = 3                          // 3 seconds before starting to display QR codes
+	msBetweenFrames   = 500                        // milleseconds between QR codes displayed to allow proper recording
+	retrieved         = "./payload/payload.bin"    // path to output payload file when video and all qr code data is retrieved
+)
 
 func init() {
+	var clear map[string]func()
 	clear = make(map[string]func()) //Initialize it
 	clear["linux"] = func() {
 		cmd := exec.Command("clear") //Linux example, its tested
@@ -324,11 +325,11 @@ func main() {
 		// Compress, encode, payload in chunks then display the QrCodes
 		compressed := smaz.Encode(nil, readText)
 		encoded := base64.StdEncoding.EncodeToString(compressed)
-		chunks := payloadInChunks(encoded, maxBytes)
+		chunks := payloadInChunks(encoded, QRCDataMaxBytes)
 		fmt.Println("\n[*] Payload will be in", len(chunks), "chunks")
-		fmt.Println("[***] Start your video, displaying in >", startTimer, "< seconds ****")
+		fmt.Println("[***] Start your video, displaying in >", secsBeforeDisplay, "< seconds ****")
 		fmt.Println()
-		time.Sleep(3 * time.Second)
+		time.Sleep(secsBeforeDisplay * time.Second)
 		// Create UI with basic HTML passed via data URI
 		const html = `
 		<html>
