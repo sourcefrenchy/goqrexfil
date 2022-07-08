@@ -30,9 +30,11 @@ import (
 	"golang.org/x/crypto/blake2b"
 )
 
-const port = "9999"
-const video = "./public/video.mp4"
+const serverPort = "9999"
+const videoLocation = "./public/video.mp4" // location of video uploaded to the web service
 const ffmpeg = "/opt/homebrew/bin/ffmpeg"
+const ffmpegQuality = "15"              // 1-31, recommended 5 for great, 10 for acceptable (this helps reduce file size)
+const ffmpegImageScale = "scale=500:-1" // 500px + keep aspect ratio
 const retrieved = "./payload/payload.bin"
 const maxBytes = 325 // 230
 const startTimer = 3
@@ -68,7 +70,7 @@ func init() {
 	}
 }
 
-// RenderQR returns a QR code string from a string
+// RenderQR returns a QR code HTML image with encoded chunk as data
 func RenderQR(chunk string) string {
 	qrCode, _ := qr.Encode(chunk, qr.H, qr.Unicode)
 	qrCode, _ = barcode.Scale(qrCode, 600, 600)
@@ -83,7 +85,7 @@ func RenderQR(chunk string) string {
 	return "<img src=\"data:image/png;base64," + encodedString + "\" />"
 }
 
-// payloadInChunks cut a string payload into multiple chunk of chunkSize
+// payloadInChunks cuts a string payload into multiple chunks of chunkSize size
 func payloadInChunks(longString string, chunkSize int) []string {
 	var slices []string
 	lastIndex := 0
@@ -125,8 +127,9 @@ func DecodeQRCode(img image.Image) string {
 	return payload
 }
 
-/* retrievePayload is the main function that will take the uploaded video, extract frames and call DecodeQRCode to get the payload
-it will also concatenate all pieces and return the full payload back */
+/* retrievePayload is the main function that will take the uploaded video,
+will extract frames and will call DecodeQRCode() to get the payload.
+it will also concatenate all pieces and finally return the full payload. */
 func retrievePayload() bool {
 	// Split video into frames using ffmpeg. Ideally it should be a module and not an exec.command call
 	files, err := filepath.Glob("./public/*png")
@@ -139,8 +142,12 @@ func retrievePayload() bool {
 			panic(err)
 		}
 	}
-	cmd := exec.Command(ffmpeg, "-i", "./public/video.mp4",
+
+	cmd := exec.Command(ffmpeg, "-i", videoLocation,
 		"-loglevel", "error", // "-r", "10",
+		"-qscale:v", ffmpegQuality,
+		"-vf", ffmpegImageScale,
+		"-vsync", "vfr",
 		"./public/%03d.png")
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
@@ -168,7 +175,7 @@ func retrievePayload() bool {
 					payload += result
 					h := blake2b.Sum256([]byte(result))
 					// fmt.Println("[*] Creating QRcode,\n   DATA_HASH ="
-					fmt.Println("[*] Retrieving data from ", match, ".\n     DATA_HASH =", hex.EncodeToString(h[:])) //,
+					fmt.Println("[*] Retrieving data from detected QR code in", match, "\n     DATA_HASH =", hex.EncodeToString(h[:])) //,
 					// "\n    Payload =", []byte(result))
 				}
 			}
@@ -180,11 +187,7 @@ func retrievePayload() bool {
 		decoded, _ := base64.StdEncoding.DecodeString(payload)
 		decompressed, _ := smaz.Decode(nil, decoded)
 		writePayloadFile(decompressed, retrieved)
-		content, err := ioutil.ReadFile(retrieved)
-		if err != nil {
-			log.Fatal(err)
-		}
-		h := blake2b.Sum256(content)
+		h := blake2b.Sum256(decompressed) // content
 		fmt.Println("[*] Payload saved as ", retrieved, "\nPayload hash", hex.EncodeToString(h[:]))
 	} else {
 		log.Info("!!! No Payload retrieved from analyzed frames")
@@ -193,7 +196,7 @@ func retrievePayload() bool {
 	return result
 }
 
-func server() {
+func webService() {
 	gin.SetMode("release")
 	//router := gin.Default()
 	router := gin.New()
@@ -227,7 +230,7 @@ func server() {
 			return
 		}
 
-		if err := c.SaveUploadedFile(file, video); err != nil {
+		if err := c.SaveUploadedFile(file, videoLocation); err != nil {
 			c.String(http.StatusBadRequest, fmt.Sprintf("upload file err: %s", err.Error()))
 			return
 		}
@@ -245,8 +248,8 @@ func server() {
 		}
 		return
 	})
-	log.Info("Serving on port ", port)
-	router.Run(":" + port)
+	log.Info("Serving on port ", serverPort)
+	router.Run(":" + serverPort)
 }
 
 func writePayloadFile(payload []byte, filename string) {
@@ -286,7 +289,7 @@ func main() {
 		FullTimestamp: true,
 	})
 	log.SetFormatter(&log.TextFormatter{})
-	isServer := flag.Bool("server", false, "server mode")
+	isServer := flag.Bool("server", false, "Server mode")
 	isClient := flag.Bool("client", false, "client mode")
 	isProcessing := flag.Bool("retrievePayload", false, "processing existing video only (debug mode)")
 	flag.Parse()
@@ -295,9 +298,9 @@ func main() {
 		log.Println("Processing only - DEBUG MODE")
 		_ = retrievePayload()
 	} else if *isServer {
-		// Server mode (retrieving data from video)
+		// webService mode (retrieving data from video)
 		fmt.Println("[*] Server mode: ON")
-		server()
+		webService()
 	} else if *isClient {
 		// Client mode (allowing video recording of QR codes)
 		fmt.Println("[***] Client mode: ON")
@@ -342,7 +345,7 @@ func main() {
 
 		// Iterate on chunks, generate QR code and display it in UI
 		for _, chunk := range chunks {
-			time.Sleep(msBetweenFrames * time.Millisecond)
+			time.Sleep(msBetweenFrames * time.Millisecond) // need some delays to allow video recording and avoid loosing a frame
 			ui.Load("data:text/html," + url.PathEscape(`<html><body><center>`+RenderQR(chunk)+`</center></body></html>`))
 		}
 		time.Sleep(msBetweenFrames * time.Millisecond)
@@ -352,7 +355,7 @@ func main() {
 	} else {
 		fmt.Println("Please use client or server mode:")
 		fmt.Println("echo \"data to send\" | ./qr --client\t\tTo use in client mode")
-		fmt.Println("./goqrexfil --server\t\t\t\t\tTo use as a TLS listener to receive video and extract data")
+		fmt.Println("./goqrexfil --server\t\t\t\t\tTo use as a TLS listener to receive video and retrieve payload.")
 		fmt.Println()
 		os.Exit(1)
 	}
