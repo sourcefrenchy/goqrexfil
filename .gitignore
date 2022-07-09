@@ -27,3 +27,4 @@ top.secret.file
 *.png_original
 payload/payload.bin
 *.mov
+.vscode/launch.json
