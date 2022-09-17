@@ -34,11 +34,11 @@ const (
 	serverPort        = "9999"                     // TCP port to run the web service on
 	videoLocation     = "./public/video.mp4"       // location of video uploaded to the web service
 	ffmpeg            = "/opt/homebrew/bin/ffmpeg" // Path to local FFMPEG - required only for server mode
-	ffmpegQuality     = "15"                       // Qualify for frames to images conversion. 1-31. 5 for great, 10 for acceptable (this helps reduce file size)
+	ffmpegQuality     = "16"                       // Qualify for frames to images conversion. 1-31. 5 for great, 10 for acceptable (this helps reduce file size)
 	ffmpegImageScale  = "scale=500:-1"             // Scale for frames to images conversion. 500px + keep aspect ratio
-	QRCDataMaxBytes   = 325                        // 230 was safe. If this gets too big, QR code will be hard to read...
+	QRCDataMaxBytes   = 320                        // 230 was safe. If this gets too big, QR code will be hard to read...
 	secsBeforeDisplay = 3                          // 3 seconds before starting to display QR codes
-	msBetweenFrames   = 500                        // milleseconds between QR codes displayed to allow proper recording
+	msBetweenFrames   = 550                        // milleseconds between QR codes displayed to allow proper recording
 	retrieved         = "./payload/payload.bin"    // path to output payload file when video and all qr code data is retrieved
 )
 
