@@ -7,7 +7,7 @@ require (
 	github.com/gin-gonic/gin v1.9.1
 	github.com/kjk/smaz v0.0.0-20151202183815-c61c680e82ff
 	github.com/liyue201/goqr v0.0.0-20200803022322-df443203d4ea
-	github.com/sirupsen/logrus v1.8.1
+	github.com/sirupsen/logrus v1.8.3
 	github.com/zserge/lorca v0.1.10
 	golang.org/x/crypto v0.45.0
 )
