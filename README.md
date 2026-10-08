@@ -16,10 +16,36 @@ retrieved by reading the data from the QR codes and a file is created with the o
 
 # Caveats/TODO
 
-* Currently very Alpha - works well with small text files, almost ok for PDFs/binary format (I need to have more time to
-  debug this)
-* Ugly code - I am not a developper, I normally use Python and wanted to try to learn Golang (be nice if you want to
-  help with improving this ugly code)
+* Works with text and binary files (PDFs, random data) - verified by the built-in self-test and the
+  end-to-end video tests in `goqrexfil_test.go`.
+* Each QR code carries a sequence number, so the server reassembles chunks in order and tells you
+  exactly which ones are missing if a frame is dropped.
+
+# Reliability: missing chunks and resume
+
+If the video misses a frame, the server reports the gap instead of silently producing a corrupt
+file:
+
+```
+[*] Received 29/38 chunks - MISSING: 4,8,12,16,20,24,28,32,36
+```
+
+The upload page (and the `/missing` endpoint) then gives you the exact chunk numbers to re-record.
+Re-run the client with `--resume` to display only those chunks, record a second short video, and
+upload it again:
+
+```
+cat top.secret.file | ./goqrexfil --client --resume 4,8,12,16,20,24,28,32,36
+```
+
+# Self-test (no camera needed)
+
+Verify the whole encode/decode pipeline locally - useful for debugging without a phone:
+
+```
+cat top.secret.file | ./goqrexfil --selftest
+[*] PASS: round-trip OK, payload hash <hex>
+```
 
 # Example
 
@@ -45,7 +71,7 @@ Start recording a video now, QR codes will be displayed on the console and stop 
 ## Have server ready to receive and process your video
 
 1. use goqrexfil in server mode
-2. From your phone, go to your server domain/ip on port 8888 e.g. http://1.2.3.4:8888/ and upload the video:
+2. From your phone, go to your server domain/ip on port 9999 e.g. http://1.2.3.4:9999/ and upload the video:
 
 Example:
 
@@ -68,7 +94,10 @@ public/005.png has payload.. Adding
 
 ## Retrieving payload
 
-```➜ cat payload.raw
+Download it from the server (`http://1.2.3.4:9999/payload`), or read the local
+`./payload/payload.bin` on the machine running the server:
+
+```➜ cat payload/payload.bin
 ------------|
 
 
