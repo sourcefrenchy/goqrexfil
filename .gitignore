@@ -16,6 +16,7 @@
 # vendor/
 goqrexfil
 *.png
+!docs/*.png
 *.jpg
 qr
 *.mp4

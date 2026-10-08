@@ -38,8 +38,25 @@ the video drops frames — no re-recording required in the common case.
                                               zstd decompress ──► [AES-GCM decrypt]
                                                         │
                                                         ▼
-                                                  payload/jobs/<job>/  ✓
+                                                   payload/jobs/<job>/  ✓
 ```
+
+## In action
+
+**Client** — the payload is shown as QR codes in the terminal (auto-fitted to the window),
+with a live progress bar. Point your phone at it and record:
+
+![client](docs/client.png)
+
+**Server** — upload the video; it extracts the frames, decodes the QRs, reconstructs the
+payload, and prints a verification code to confirm the transfer:
+
+![server](docs/server.png)
+
+**Grid mode** — `--grid 2` shows two QR codes per frame (higher symbol rate, easier to
+scan) on a wide terminal:
+
+![grid](docs/grid.png)
 
 ## Requirements
 
