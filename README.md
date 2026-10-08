@@ -278,8 +278,14 @@ one fits.
 `--grid N` renders N QR codes side by side in each frame; the server decodes all of them
 (find-blank-repeat). This raises the **symbol rate** and, because each code is smaller, is
 often **easier to scan** (more robust). It only helps when the terminal is wide enough to
-fit the extra codes — on a narrow terminal auto-fit will pick `--grid 1` anyway. Use a wide
-terminal (200+ columns) to get the most from `--grid 2`.
+fit the extra codes — use a wide terminal (200+ columns) to get the most from `--grid 2`.
+
+> **Warning: `--grid 2` does not work in cmd.exe (or the default 80-column Terminal.app).**
+> Two QR codes side by side need more than 80 columns, so on an 80×24 terminal there is no
+> symbol size that fits and the client exits with `Terminal 80x24 is too small for a QR
+> code`. On narrow terminals just use the default single QR (`--grid 1`), or widen the
+> window. (Windows Terminal opens at 120 columns, where `--grid 2` fits — but at 120 it's
+> no faster than a single QR; you need ~200 columns for the 2× gain.)
 
 ### Dwell time
 
