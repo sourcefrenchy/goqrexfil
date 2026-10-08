@@ -11,11 +11,29 @@ import (
 	"github.com/boombuler/barcode"
 	"github.com/boombuler/barcode/qr"
 	goqr "github.com/liyue201/goqr"
+	zxing "github.com/makiuchi-d/gozxing"
+	zxingqr "github.com/makiuchi-d/gozxing/qrcode"
 	log "github.com/sirupsen/logrus"
+	xdraw "golang.org/x/image/draw"
 )
 
-// DecodeQRCode returns the payload string found in img, or "" if none.
-func DecodeQRCode(img image.Image) string {
+var zxingReader = zxingqr.NewQRCodeReader()
+
+// decodeWithZXing tries to read a QR code from img using gozxing.
+func decodeWithZXing(img image.Image) string {
+	bitmap, err := zxing.NewBinaryBitmapFromImage(img)
+	if err != nil {
+		return ""
+	}
+	res, err := zxingReader.Decode(bitmap, nil)
+	if err != nil {
+		return ""
+	}
+	return res.GetText()
+}
+
+// decodeWithGoQR tries to read a QR code from img using the legacy goqr reader.
+func decodeWithGoQR(img image.Image) string {
 	b := img.Bounds()
 	rgba := image.NewRGBA(b)
 	draw.Draw(rgba, b, img, b.Min, draw.Src)
@@ -28,6 +46,39 @@ func DecodeQRCode(img image.Image) string {
 		payload = payload + string(qrCode.Payload)
 	}
 	return payload
+}
+
+// scaleImage returns a copy of img scaled by factor (using high-quality
+// bi-linear interpolation). factor > 1 upscales, < 1 downscales.
+func scaleImage(img image.Image, factor float64) image.Image {
+	b := img.Bounds()
+	w := int(float64(b.Dx())*factor + 0.5)
+	h := int(float64(b.Dy())*factor + 0.5)
+	if w < 1 {
+		w = 1
+	}
+	if h < 1 {
+		h = 1
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	xdraw.BiLinear.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
+	return dst
+}
+
+// DecodeQRCode returns the payload string found in img, or "" if none. It tries a
+// ladder of decoders and scales: gozxing at native, 2x, and 0.5x, then the legacy
+// goqr reader at native. The first success wins.
+func DecodeQRCode(img image.Image) string {
+	if s := decodeWithZXing(img); s != "" {
+		return s
+	}
+	if s := decodeWithZXing(scaleImage(img, 2)); s != "" {
+		return s
+	}
+	if s := decodeWithZXing(scaleImage(img, 0.5)); s != "" {
+		return s
+	}
+	return decodeWithGoQR(img)
 }
 
 // encodeQR renders data as a PNG QR code image (error correction H). Used by the
