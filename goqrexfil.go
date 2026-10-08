@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/blake2b"
+	"golang.org/x/term"
 )
 
 const (
@@ -23,7 +24,9 @@ const (
 	ffmpegQuality     = "16"                      // Quality for frames to images conversion. 1-31. 5 for great, 10 for acceptable
 	ffmpegImageScale  = "scale='min(iw,1600)':-1" // Cap very large (4K) frames at 1600px wide; never downscale normal frames, since shrinking the QR below ~600px breaks recognition
 	secsBeforeDisplay = 3                         // seconds before starting to display QR codes
-	msBetweenFrames   = 550                       // milliseconds each QR is held, to allow proper recording
+	defaultDwell      = 300                       // default ms each frame is held (30fps-safe: >=3 camera frames + focus lock)
+	defaultGrid       = 1                         // default QR codes per frame (1 fits a 120x40 terminal; 2 needs ~140 cols)
+	gridGap           = 2                         // modules of gap between grid cells (on top of quiet zones)
 	warmupSeconds     = 2                         // seconds to hold the warm-up pattern so auto-focus/exposure lock
 	maxUploadSize     = 512 << 20                 // 512 MB upload cap
 	defaultRedundancy = 50                        // default RaptorQ redundancy, in percent of k
@@ -160,6 +163,7 @@ func processVideoForJob(reg *jobRegistry, jobName, key string) *jobState {
 	matches, _ := filepath.Glob("./public/*png")
 	fmt.Println("[***] Extracting symbols from", len(matches), "frames (job:", jobName+")")
 	lastReport := 0
+frames:
 	for _, match := range matches {
 		f, err := os.Open(match)
 		if err != nil {
@@ -170,51 +174,46 @@ func processVideoForJob(reg *jobRegistry, jobName, key string) *jobState {
 		if err != nil {
 			continue
 		}
-		raw := DecodeQRCode(img)
-		if raw == "" {
-			continue
-		}
-		mode, blobLen, id, sym, ok := parseSymbol(raw)
-		if !ok {
-			fmt.Println("[!] Skipping frame", match, "with unrecognized format")
-			continue
-		}
-		done, err := dec.add(mode, blobLen, id, sym)
-		if err != nil {
-			log.Errorf("decoder: %v", err)
-			continue
-		}
-		if r := dec.receivedCount(); r > lastReport+24 {
-			lastReport = r
-			fmt.Printf("[*] received %d symbols (need ~%d)\n", r, dec.baseSymbols())
-		}
-		if done {
-			if job.complete {
-				break
+		for _, raw := range decodeAll(img, 8) {
+			mode, blobLen, id, sym, ok := parseSymbol(raw)
+			if !ok {
+				fmt.Println("[!] Skipping frame", match, "with unrecognized format")
+				continue
 			}
-			payload, err := dec.finish()
+			done, err := dec.add(mode, blobLen, id, sym)
 			if err != nil {
-				log.Fatalf("reconstruct: %v", err)
+				log.Errorf("decoder: %v", err)
+				continue
 			}
-			n, dest, err := savePayload(payload, jobName)
-			if err != nil {
-				log.Fatalf("save payload: %v", err)
+			if r := dec.receivedCount(); r > lastReport+24 {
+				lastReport = r
+				fmt.Printf("[*] received %d symbols (need ~%d)\n", r, dec.baseSymbols())
 			}
-			h := blake2b.Sum256(payload)
-			job.complete = true
-			job.dest = dest
-			job.files = n
-			job.hash = fmtHash(h[:])
-			job.code = humanCode(h[:])
-			fmt.Printf("[*] Payload reconstructed from %d symbols (need ~%d)\n", dec.receivedCount(), dec.baseSymbols())
-			if n > 0 {
-				fmt.Println("[*] Directory payload:", n, "files extracted to", dest)
-			} else {
-				fmt.Println("[*] Payload saved as", dest)
+			if done && !job.complete {
+				payload, err := dec.finish()
+				if err != nil {
+					log.Fatalf("reconstruct: %v", err)
+				}
+				n, dest, err := savePayload(payload, jobName)
+				if err != nil {
+					log.Fatalf("save payload: %v", err)
+				}
+				h := blake2b.Sum256(payload)
+				job.complete = true
+				job.dest = dest
+				job.files = n
+				job.hash = fmtHash(h[:])
+				job.code = humanCode(h[:])
+				fmt.Printf("[*] Payload reconstructed from %d symbols (need ~%d)\n", dec.receivedCount(), dec.baseSymbols())
+				if n > 0 {
+					fmt.Println("[*] Directory payload:", n, "files extracted to", dest)
+				} else {
+					fmt.Println("[*] Payload saved as", dest)
+				}
+				fmt.Println("Payload hash", job.hash)
+				fmt.Println("Verification code", job.code)
+				break frames
 			}
-			fmt.Println("Payload hash", job.hash)
-			fmt.Println("Verification code", job.code)
-			break
 		}
 	}
 
@@ -397,7 +396,7 @@ func webService(token, key string, tlsEnabled bool, certFile, keyFile string) {
 
 // clientMode reads the payload, encodes it as a RaptorQ symbol stream, and
 // displays a (sub-)range of symbols as terminal QR codes for video recording.
-func clientMode(path string, redundancy int, key, job string, start, count int, dryRun, noQuiet, noWarmup bool) {
+func clientMode(path string, redundancy, symbolSize, dwell, grid int, key, job string, start, count int, dryRun, noQuiet, noWarmup bool) {
 	fmt.Println("[***] Client mode: ON")
 	data, name, err := resolvePayloadSource(path)
 	if err != nil {
@@ -413,8 +412,42 @@ func clientMode(path string, redundancy int, key, job string, start, count int, 
 	if key != "" {
 		fmt.Println("[*] Encryption: ON")
 	}
+	if grid < 1 {
+		grid = 1
+	}
+	if dwell < 100 {
+		dwell = 100
+	}
+	qz := 4
+	if noQuiet {
+		qz = 0
+	}
 
-	framed, k, mode, err := encodePayload(data, redundancy, key)
+	// Resolve the symbol size. --symbol-size 0 (default) auto-fits the largest
+	// QR that fits the detected terminal, so it never clips on 80x24 cmd.exe,
+	// Terminal.app, Windows Terminal, etc.
+	if symbolSize <= 0 {
+		cols, rows := terminalSize()
+		if cols > 0 && rows > 0 {
+			fit := fitSymbolSize(grid, cols, rows, qz)
+			if fit > 0 {
+				symbolSize = fit
+			}
+			fmt.Printf("[*] Terminal %dx%d: auto-fit symbol size = %d B\n", cols, rows, symbolSize)
+			if fit <= 0 {
+				log.Fatalf("Terminal %dx%d is too small for a QR code. Enlarge it (or use --no-quiet-zone / a wider terminal) and retry.", cols, rows)
+			}
+			if fit < 24 {
+				fmt.Println("[!] That's a very small QR (slow transfer). Enlarge the terminal for a faster, more reliable transfer.")
+			}
+		}
+		if symbolSize <= 0 {
+			symbolSize = defaultSymbolSize
+			fmt.Printf("[!] Could not detect terminal size; using %d B/symbol. Use a larger terminal or --symbol-size.\n", symbolSize)
+		}
+	}
+
+	framed, k, mode, err := encodePayload(data, redundancy, symbolSize, key)
 	if err != nil {
 		log.Fatalf("encode: %v", err)
 	}
@@ -437,10 +470,13 @@ func clientMode(path string, redundancy int, key, job string, start, count int, 
 		}
 	}
 	selected := framed[from:to]
-	secs := float64(len(selected)) * msBetweenFrames / 1000
+	// Frames: each frame shows `grid` symbols side by side.
+	nFrames := (len(selected) + grid - 1) / grid
+	secs := float64(nFrames) * float64(dwell) / 1000
 
-	fmt.Printf("\n[*] %d base symbols, %d total (redundancy %d%%, mode %s)\n", k, m, redundancy, mode)
-	fmt.Printf("[*] This video: symbols %d-%d (%d of %d)\n", from+1, to, len(selected), m)
+	fmt.Printf("\n[*] %d base symbols, %d total (redundancy %d%%, mode %s, %d B/symbol)\n", k, m, redundancy, mode, symbolSize)
+	fmt.Printf("[*] This video: symbols %d-%d (%d of %d) in %d frames (%d/frame, %dms dwell)\n",
+		from+1, to, len(selected), m, nFrames, grid, dwell)
 	fmt.Printf("[*] Estimated recording time: ~%.0fs\n", secs)
 
 	if dryRun {
@@ -448,14 +484,17 @@ func clientMode(path string, redundancy int, key, job string, start, count int, 
 		return
 	}
 
-	qz := 4
-	if noQuiet {
-		qz = 0
-	}
-	if w, err := qrTerminalWidth(selected[0], qz); err == nil {
-		if cols := termCols(); cols > 0 && w > cols {
-			fmt.Printf("[!] QR is ~%d columns wide but terminal is %d. Widen the terminal%s.\n",
-				w, cols, hintNoQuiet(noQuiet))
+	// Warn if the frame is wider/taller than the terminal (only possible if the
+	// user forced a too-large --symbol-size, since auto-fit prevents it).
+	if w, rth, err := gridTerminalSize(selected, grid, qz, gridGap); err == nil {
+		if cols, rows := terminalSize(); cols > 0 && rows > 0 {
+			if w > cols {
+				fmt.Printf("[!] Frame is ~%d columns wide but terminal is %d. Widen the terminal or lower --symbol-size%s.\n",
+					w, cols, hintNoQuiet(noQuiet))
+			}
+			if rth > rows {
+				fmt.Printf("[!] Frame is ~%d rows tall but terminal is %d. Use a taller terminal, --grid 1, or lower --symbol-size.\n", rth, rows)
+			}
 		}
 	}
 
@@ -471,14 +510,27 @@ func clientMode(path string, redundancy int, key, job string, start, count int, 
 	fmt.Println("[***] Point your phone at this terminal; the stream starts in >", secsBeforeDisplay, "< seconds ****")
 	time.Sleep(secsBeforeDisplay * time.Second)
 
-	for i, f := range selected {
-		time.Sleep(msBetweenFrames * time.Millisecond)
-		caption := fmt.Sprintf("goqrexfil  job %s  %s  symbol %d/%d", job, progressBar(i+1, len(selected), 12), from+i+1, m)
-		if err := displayQRTerminal(f, caption, qz); err != nil {
-			log.Fatalf("display: %v", err)
+	for f := 0; f < nFrames; f++ {
+		time.Sleep(time.Duration(dwell) * time.Millisecond)
+		lo := f * grid
+		hi := lo + grid
+		if hi > len(selected) {
+			hi = len(selected)
+		}
+		cells := selected[lo:hi]
+		caption := fmt.Sprintf("goqrexfil  job %s  %s  frame %d/%d  symbol %d/%d",
+			job, progressBar(f+1, nFrames, 12), f+1, nFrames, lo+1, m)
+		if len(cells) == 1 {
+			if err := displayQRTerminal(cells[0], caption, qz); err != nil {
+				log.Fatalf("display: %v", err)
+			}
+		} else {
+			if err := displayGridTerminal(cells, grid, qz, gridGap, caption); err != nil {
+				log.Fatalf("display: %v", err)
+			}
 		}
 	}
-	time.Sleep(msBetweenFrames * time.Millisecond)
+	time.Sleep(time.Duration(dwell) * time.Millisecond)
 	fmt.Printf("\x1b[2J\x1b[HDone - stop recording.\nJob: %s\nVerification code: %s\n", job, humanCode(h[:]))
 }
 
@@ -489,25 +541,65 @@ func hintNoQuiet(noQuiet bool) string {
 	return " (or re-run with --no-quiet-zone to save 8 columns)"
 }
 
-// termCols best-effort terminal width from $COLUMNS (0 if unknown).
-func termCols() int {
+// terminalSize returns the visible terminal dimensions (cols, rows), 0 if unknown.
+// It uses the platform TTY query (works on Windows conhost/Windows Terminal, macOS
+// Terminal, and Linux), falling back to $COLUMNS/$LINES. This matters because
+// cmd.exe/Windows Terminal do not set $COLUMNS.
+func terminalSize() (int, int) {
+	if cols, rows, err := term.GetSize(int(os.Stdout.Fd())); err == nil && cols > 0 && rows > 0 {
+		return cols, rows
+	}
+	cols := 0
 	if c := os.Getenv("COLUMNS"); c != "" {
-		var n int
-		if _, err := fmt.Sscanf(c, "%d", &n); err == nil {
-			return n
+		fmt.Sscanf(c, "%d", &cols)
+	}
+	rows := 0
+	if c := os.Getenv("LINES"); c != "" {
+		fmt.Sscanf(c, "%d", &rows)
+	}
+	return cols, rows
+}
+
+// fitSymbolSize returns the largest RaptorQ symbol size (bytes) whose rendered QR
+// grid fits the terminal (cols x rows), reserving 2 rows for the caption. It
+// binary-searches the symbol size, measuring a real framed symbol each time.
+// Returns 0 if even the smallest QR is too big.
+func fitSymbolSize(grid, cols, rows, quiet int) int {
+	if cols <= 0 || rows <= 0 {
+		return 0
+	}
+	usableH := rows - 2 // reserve caption rows
+	fits := func(symbolSize int) bool {
+		// A real framed symbol of this size (max-length header + base64 body).
+		sym := make([]byte, symbolSize)
+		framed := formatSymbol(modeCompressed, 9999999, 99999, sym)
+		dummy := make([]string, grid)
+		for i := range dummy {
+			dummy[i] = framed
+		}
+		w, h, err := gridTerminalSize(dummy, grid, quiet, gridGap)
+		return err == nil && w <= cols && h <= usableH
+	}
+	lo, hi, best := 4, 240, 0
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if fits(mid) {
+			best, lo = mid, mid+1
+		} else {
+			hi = mid - 1
 		}
 	}
-	return 0
+	return best
 }
 
 func selfTest(data []byte, key string) {
 	fmt.Println("[***] Self-test mode: local QR round-trip, no camera needed")
-	framed, k, mode, err := encodePayload(data, defaultRedundancy, key)
+	framed, k, mode, err := encodePayload(data, defaultRedundancy, defaultSymbolSize, key)
 	if err != nil {
 		log.Fatalf("encode: %v", err)
 	}
 	m := len(framed)
-	fmt.Printf("[*] %d base symbols, %d total (mode %s)\n", k, m, mode)
+	fmt.Printf("[*] %d base symbols, %d total (mode %s, %d B/symbol)\n", k, m, mode, defaultSymbolSize)
 
 	dir, err := os.MkdirTemp("", "goqrexfil-selftest-")
 	if err != nil {
@@ -516,19 +608,28 @@ func selfTest(data []byte, key string) {
 	defer os.RemoveAll(dir)
 
 	dec := newDecoder(key)
-	// Simulate a lossy capture: keep only 80% of the symbols.
+	// Simulate a lossy grid capture: pack symbols into 2-wide frames, and drop
+	// one frame in five (80% capture). Each frame is a composed grid PNG.
+	const grid = 2
+	nFrames := (m + grid - 1) / grid
 	kept := 0
-	for i, f := range framed {
-		if i%5 == 4 {
+	for f := 0; f < nFrames; f++ {
+		if f%5 == 4 {
 			continue // dropped frame
 		}
-		kept++
-		pngBytes := encodeQR(f)
-		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%04d.png", i)), pngBytes, 0644); err != nil {
+		lo := f * grid
+		hi := lo + grid
+		if hi > m {
+			hi = m
+		}
+		cells := framed[lo:hi]
+		pngBytes := composeGridPNG(cells, grid, 8, 4, 8)
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%04d.png", f)), pngBytes, 0644); err != nil {
 			log.Fatal(err)
 		}
+		kept += len(cells)
 	}
-	fmt.Println("[*] Wrote", kept, "of", m, "QR PNGs (simulating 80% capture) to", dir)
+	fmt.Println("[*] Wrote", kept, "of", m, "symbols across", nFrames, "grid frames (80% captured) to", dir)
 
 	matches, _ := filepath.Glob(filepath.Join(dir, "*.png"))
 	for _, match := range matches {
@@ -541,12 +642,14 @@ func selfTest(data []byte, key string) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		mode2, blobLen, id, sym, ok := parseSymbol(DecodeQRCode(img))
-		if !ok {
-			log.Fatalf("FAIL: could not decode QR in %s", match)
-		}
-		if _, err := dec.add(mode2, blobLen, id, sym); err != nil {
-			log.Fatalf("FAIL: decoder error: %v", err)
+		for _, raw := range decodeAll(img, grid) {
+			mode2, blobLen, id, sym, ok := parseSymbol(raw)
+			if !ok {
+				log.Fatalf("FAIL: could not parse QR in %s", match)
+			}
+			if _, err := dec.add(mode2, blobLen, id, sym); err != nil {
+				log.Fatalf("FAIL: decoder error: %v", err)
+			}
 		}
 	}
 
@@ -573,6 +676,9 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "Server: TLS certificate file (with --tls)")
 	tlsKey := flag.String("tls-key", "", "Server: TLS key file (with --tls)")
 	redundancy := flag.Int("redundancy", defaultRedundancy, "Client: RaptorQ redundancy as % of base symbols")
+	symbolSize := flag.Int("symbol-size", 0, "Client: raw bytes per QR symbol (0 = auto-fit to the terminal; smaller = smaller, more reliably-scanned QRs)")
+	dwell := flag.Int("dwell", defaultDwell, "Client: ms each frame is held (300 is 30fps-safe; lower = faster but riskier)")
+	grid := flag.Int("grid", defaultGrid, "Client: QR codes shown side-by-side per frame (2 = 2x1 grid)")
 	job := flag.String("job", defaultJob, "Job name; uploads to the same job accumulate across videos")
 	start := flag.Int("start", 1, "Client: first symbol id to display (1-based), for splitting a transfer")
 	count := flag.Int("count", 0, "Client: number of symbols to display (0 = to the end)")
@@ -602,7 +708,7 @@ func main() {
 		if flag.NArg() > 0 {
 			path = flag.Arg(0)
 		}
-		clientMode(path, *redundancy, *key, *job, *start, *count, *dryRun, *noQuiet, *noWarmup)
+		clientMode(path, *redundancy, *symbolSize, *dwell, *grid, *key, *job, *start, *count, *dryRun, *noQuiet, *noWarmup)
 	} else {
 		fmt.Println("goqrexfil - exfiltrate data as QR codes captured on video")
 		fmt.Println()
@@ -612,6 +718,8 @@ func main() {
 		fmt.Println("  ./goqrexfil --client --key PASSPHRASE ./secrets        encrypt the payload")
 		fmt.Println("  ./goqrexfil --client --dry-run ./secrets               show size/time estimate only")
 		fmt.Println("  ./goqrexfil --client --redundancy 100 ./secrets        more redundancy (longer, more robust)")
+		fmt.Println("  ./goqrexfil --client --grid 2 --dwell 300 ./secrets     2x1 grid, 300ms dwell (default)")
+		fmt.Println("  ./goqrexfil --client --grid 1 --symbol-size 240 ./secrets  one big QR per frame")
 		fmt.Println("  ./goqrexfil --client --job big --start 1 --count 20000  display a symbol range (split a transfer)")
 		fmt.Println("  cat file | ./goqrexfil --selftest                      local round-trip test, no camera")
 		fmt.Println()
