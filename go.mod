@@ -12,6 +12,7 @@ require (
 	github.com/xssnick/raptorq v1.6.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/image v0.46.0
+	golang.org/x/term v0.46.0
 )
 
 require (
