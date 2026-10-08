@@ -40,7 +40,7 @@ func redirectOutputs(t *testing.T) {
 }
 
 func TestParseSymbolRoundTrip(t *testing.T) {
-	sym := pseudoRandom(symbolSize)
+	sym := pseudoRandom(defaultSymbolSize)
 	for _, mode := range []string{modeCompressed, modeEncrypted} {
 		for _, bl := range []uint32{1, 1000, 1 << 20} {
 			for _, id := range []uint32{0, 1, 42, 56402} {
@@ -108,7 +108,7 @@ func TestAesGcmRoundTrip(t *testing.T) {
 
 func TestEncodeDecodeSubsetUnencrypted(t *testing.T) {
 	payload := pseudoRandom(240000)
-	framed, k, mode, err := encodePayload(payload, 50, "")
+	framed, k, mode, err := encodePayload(payload, 50, defaultSymbolSize, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestEncodeDecodeSubsetUnencrypted(t *testing.T) {
 func TestEncodeDecodeEncrypted(t *testing.T) {
 	payload := pseudoRandom(60000)
 	const key = "s3cret"
-	framed, _, mode, err := encodePayload(payload, 50, key)
+	framed, _, mode, err := encodePayload(payload, 50, defaultSymbolSize, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestEncodeDecodeEncrypted(t *testing.T) {
 
 func TestDecoderDuplicateSymbols(t *testing.T) {
 	payload := pseudoRandom(24000)
-	framed, _, _, err := encodePayload(payload, 50, "")
+	framed, _, _, err := encodePayload(payload, 50, defaultSymbolSize, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +373,7 @@ func TestJobMultiVideoAssembly(t *testing.T) {
 	}
 	redirectOutputs(t)
 	original := pseudoRandom(8000)
-	framed, _, _, err := encodePayload(original, defaultRedundancy, "")
+	framed, _, _, err := encodePayload(original, defaultRedundancy, defaultSymbolSize, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +418,7 @@ func TestJobIsolation(t *testing.T) {
 	}
 	redirectOutputs(t)
 	original := pseudoRandom(4000)
-	framed, _, _, err := encodePayload(original, defaultRedundancy, "")
+	framed, _, _, err := encodePayload(original, defaultRedundancy, defaultSymbolSize, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +444,7 @@ func TestJobIsolation(t *testing.T) {
 
 func TestClientRangeSelection(t *testing.T) {
 	payload := pseudoRandom(24000)
-	framed, _, _, err := encodePayload(payload, 50, "")
+	framed, _, _, err := encodePayload(payload, 50, defaultSymbolSize, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -560,13 +560,186 @@ func buildVideo(t *testing.T, framed []string, dropEvery int) (string, []int) {
 	return video, dropped
 }
 
+// buildGridVideo renders frames as a `grid`-wide QR grid and encodes them into an
+// mp4, mimicking a phone recording of the grid display.
+func buildGridVideo(t *testing.T, framed []string, grid, dropEvery int) (string, []int) {
+	t.Helper()
+	dir := t.TempDir()
+	var dropped []int
+	nFrames := (len(framed) + grid - 1) / grid
+	frame := 0
+	for f := 0; f < nFrames; f++ {
+		if dropEvery > 0 && f%dropEvery == dropEvery-1 {
+			dropped = append(dropped, f)
+			continue
+		}
+		lo := f * grid
+		hi := lo + grid
+		if hi > len(framed) {
+			hi = len(framed)
+		}
+		pngBytes := composeGridPNG(framed[lo:hi], grid, 8, 4, 8)
+		for r := 0; r < 5; r++ {
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%03d.png", frame)), pngBytes, 0644); err != nil {
+				t.Fatal(err)
+			}
+			frame++
+		}
+	}
+	video := filepath.Join(dir, "video.mp4")
+	cmd := exec.Command("ffmpeg", "-y", "-framerate", "2", "-i", filepath.Join(dir, "%03d.png"),
+		"-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", video)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("ffmpeg: %v\n%s", err, out)
+	}
+	return video, dropped
+}
+
+// TestGridMultiDecode verifies decodeAll finds every QR in a composed grid frame.
+func TestGridMultiDecode(t *testing.T) {
+	cells := []string{
+		"GQ3:z:10:0:" + strings.Repeat("A", 100),
+		"GQ3:z:10:1:" + strings.Repeat("B", 100),
+	}
+	imgBytes := composeGridPNG(cells, 2, 8, 4, 8)
+	// decode the PNG
+	f, err := os.CreateTemp("", "grid-*.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write(imgBytes); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	img := loadPNG(t, f.Name())
+	got := decodeAll(img, 4)
+	if len(got) != 2 {
+		t.Fatalf("decodeAll found %d, want 2: %v", len(got), got)
+	}
+	seen := map[string]bool{}
+	for _, g := range got {
+		seen[g] = true
+	}
+	for _, want := range cells {
+		if !seen[want] {
+			t.Fatalf("missing cell %q in %v", want, got)
+		}
+	}
+}
+
+// TestEndToEndGridVideo runs the full server pipeline on a 2-wide grid video.
+func TestEndToEndGridVideo(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not available")
+	}
+	redirectOutputs(t)
+	original := pseudoRandom(8000)
+	framed, _, _, err := encodePayload(original, defaultRedundancy, defaultSymbolSize, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	video, _ := buildGridVideo(t, framed, 2, 0)
+	if err := os.WriteFile(videoLocation, mustRead(t, video), 0644); err != nil {
+		t.Fatal(err)
+	}
+	job := processVideoForJob(newJobRegistry(), "grid", "")
+	if !job.complete {
+		t.Fatalf("expected complete, received=%d", job.dec.receivedCount())
+	}
+	got, err := os.ReadFile(jobPayloadPath("grid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatal("grid e2e payload mismatch")
+	}
+}
+
+// TestEndToEndGridVideoDroppedFrames verifies grid + fountain coding survive a
+// dropped frame (one whole grid frame lost).
+func TestEndToEndGridVideoDroppedFrames(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not available")
+	}
+	redirectOutputs(t)
+	original := pseudoRandom(8000)
+	framed, _, _, err := encodePayload(original, defaultRedundancy, defaultSymbolSize, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	video, dropped := buildGridVideo(t, framed, 2, 4) // drop 1 grid frame in 4
+	if len(dropped) == 0 {
+		t.Fatal("expected dropped frames")
+	}
+	if err := os.WriteFile(videoLocation, mustRead(t, video), 0644); err != nil {
+		t.Fatal(err)
+	}
+	job := processVideoForJob(newJobRegistry(), "grid", "")
+	if !job.complete {
+		t.Fatalf("expected payload to survive dropped grid frames, received=%d", job.dec.receivedCount())
+	}
+	got, _ := os.ReadFile(jobPayloadPath("grid"))
+	if !bytes.Equal(got, original) {
+		t.Fatal("grid payload mismatch after dropped frames")
+	}
+}
+
+// TestFitSymbolSize verifies auto-fit picks a symbol size that fits the terminal
+// for real-world terminal dimensions (cmd.exe 80x24, Windows Terminal 120x30,
+// macOS Terminal, wide terminals), and that grid=2 wins on wide terminals.
+func TestFitSymbolSize(t *testing.T) {
+	cases := []struct {
+		cols, rows, grid, qz int
+		wantZero             bool // true = terminal too small, expect 0
+	}{
+		{80, 24, 1, 4, false},  // cmd.exe / Terminal.app default: fits a small QR
+		{80, 24, 2, 4, true},   // same terminal, grid=2: too small
+		{80, 24, 1, 0, false},  // no quiet zone fits more
+		{120, 30, 1, 4, false}, // Windows Terminal default
+		{120, 40, 1, 4, false}, // larger
+		{200, 50, 1, 4, false}, // very wide
+		{200, 50, 2, 4, false}, // wide with grid
+	}
+	for _, c := range cases {
+		fit := fitSymbolSize(c.grid, c.cols, c.rows, c.qz)
+		if c.wantZero {
+			if fit != 0 {
+				t.Fatalf("fitSymbolSize(%d,%d,%d,qz=%d) = %d, want 0 (too small)", c.grid, c.cols, c.rows, c.qz, fit)
+			}
+			continue
+		}
+		if fit <= 0 {
+			t.Fatalf("fitSymbolSize(%d,%d,%d,qz=%d) = 0, nothing fits", c.grid, c.cols, c.rows, c.qz)
+		}
+		// The fitted size must actually render within the terminal.
+		sym := make([]byte, fit)
+		framed := formatSymbol(modeCompressed, 9999999, 99999, sym)
+		dummy := make([]string, c.grid)
+		for i := range dummy {
+			dummy[i] = framed
+		}
+		w, h, err := gridTerminalSize(dummy, c.grid, c.qz, gridGap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w > c.cols || h > c.rows-2 {
+			t.Fatalf("fit %d renders %dx%d, exceeds %dx%d (usable %d)", fit, w, h, c.cols, c.rows, c.rows-2)
+		}
+	}
+	// grid=2 must yield >= as many bytes/frame as grid=1 on a wide terminal.
+	if b1 := fitSymbolSize(1, 200, 50, 4); b1 > fitSymbolSize(2, 200, 50, 4)*2 {
+		t.Fatalf("grid=2 should beat grid=1 on a wide terminal: %d vs %d", b1, fitSymbolSize(2, 200, 50, 4)*2)
+	}
+}
+
 func TestEndToEndVideo(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not available")
 	}
 	redirectOutputs(t)
 	original := pseudoRandom(8000)
-	framed, _, _, err := encodePayload(original, defaultRedundancy, "")
+	framed, _, _, err := encodePayload(original, defaultRedundancy, defaultSymbolSize, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,7 +768,7 @@ func TestEndToEndVideoDroppedFrames(t *testing.T) {
 	}
 	redirectOutputs(t)
 	original := pseudoRandom(8000)
-	framed, _, _, err := encodePayload(original, defaultRedundancy, "")
+	framed, _, _, err := encodePayload(original, defaultRedundancy, defaultSymbolSize, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,7 +796,7 @@ func TestEndToEndVideoEncrypted(t *testing.T) {
 	redirectOutputs(t)
 	const key = "video-key"
 	original := pseudoRandom(6000)
-	framed, _, mode, err := encodePayload(original, defaultRedundancy, key)
+	framed, _, mode, err := encodePayload(original, defaultRedundancy, defaultSymbolSize, key)
 	if err != nil {
 		t.Fatal(err)
 	}
