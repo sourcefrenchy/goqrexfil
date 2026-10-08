@@ -1,4 +1,8 @@
-# goqrexfil
+<p align="center">
+  <img src="docs/banner.png" alt="goqrexfil — exfiltrate data as QR codes on video" width="720"/>
+</p>
+
+<br>
 
 Exfiltrate data as **QR codes captured on video** — a cover channel that never touches the
 network.
@@ -57,6 +61,21 @@ payload, and prints a verification code to confirm the transfer:
 scan) on a wide terminal:
 
 ![grid](docs/grid.png)
+
+## Tech stack
+
+* **zstd** (compression) — the payload is compressed before it becomes QR codes. zstd is
+  fast and compresses text/PDFs/source far better than the classic gzip or the old smaz,
+  so fewer symbols, fewer frames, shorter recording. It's pure Go (no cgo), so the binary
+  stays portable.
+* **RaptorQ** (erasure / fountain coding) — the payload is split into a stream of symbols
+  with redundancy, so the server can reconstruct it from *any* sufficient subset. A dropped
+  or unreadable frame is absorbed instead of corrupting the file or forcing a re-record.
+  RaptorQ (RFC 6330) scales to tens of thousands of symbols, unlike plain Reed-Solomon
+  (capped at 255), which is why a large transfer works at all.
+* **gozxing** (QR decoding) — a strong, maintained QR reader used in a multi-scale ladder
+  (native, 2×, 0.5×) with a legacy fallback. It's far more tolerant of the compression
+  artifacts, blur, and scaling a phone video introduces than a single reader at one scale.
 
 ## Requirements
 
