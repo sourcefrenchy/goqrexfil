@@ -76,9 +76,10 @@ cat top.secret.file | ./goqrexfil --client
 [*] Source: stdin (8.2 KiB)
 Plaintext hash 9f2c...
 Verification code K7PD-4MQX
-[*] 38 base symbols, 57 total (redundancy 50%, mode z)
-[*] This video: symbols 1-57 (57 of 57)
-[*] Estimated recording time: ~31s
+[*] Terminal 120x40: auto-fit symbol size = 99 B
+[*] 84 base symbols, 126 total (redundancy 50%, mode z, 99 B/symbol)
+[*] This video: symbols 1-126 (126 of 126) in 126 frames (1/frame, 300ms dwell)
+[*] Estimated recording time: ~38s
 [***] Point your phone at this terminal; the stream starts in > 3 < seconds ****
 ```
 
@@ -207,6 +208,51 @@ and **round-trip an encrypted payload**:
 go test ./...
 ```
 
+## Fitting your terminal (auto-density, grid, dwell)
+
+A QR code is only as good as the terminal it's drawn in. The tool **auto-fits** the symbol
+size to your actual terminal so it never clips — it queries the real TTY size (works on
+Windows conhost/Windows Terminal, macOS Terminal, and Linux; it does *not* rely on
+`$COLUMNS`, which cmd.exe doesn't set) and picks the largest symbol that fits:
+
+```sh
+./goqrexfil --client --dry-run ./file
+[*] Terminal 120x30: auto-fit symbol size = 33 B
+[*] 152 base symbols, 228 total (redundancy 50%, mode z, 33 B/symbol)
+```
+
+The bigger the terminal, the bigger each QR, the fewer frames, and the faster the transfer.
+The practical reality for common terminals (incompressible data, 50% redundancy, 300 ms
+dwell):
+
+| Terminal | Auto-fit symbol | Bytes/frame | 1 MB takes (approx) |
+| --- | --- | --- | --- |
+| 80×24 (cmd.exe / Terminal.app default) | 9 B | 9 | ~75 h (use `--no-quiet-zone` → 27 B) |
+| 120×30 (Windows Terminal default) | 33 B | 33 | ~3.9 h |
+| 120×40 | 99 B | 99 | ~78 min |
+| 200×50 | 195 B | 195 | ~40 min |
+| 200×50 with `--grid 2` | 195 B ×2 | 390 | ~20 min |
+
+**Make the terminal as big as you comfortably can** — it's the single biggest lever on
+throughput. If it's small, `--no-quiet-zone` shrinks each QR by 8 columns/rows so a bigger
+one fits.
+
+### Grid (multiple QRs per frame)
+
+`--grid N` renders N QR codes side by side in each frame; the server decodes all of them
+(find-blank-repeat). This raises the **symbol rate** and, because each code is smaller, is
+often **easier to scan** (more robust). It only helps when the terminal is wide enough to
+fit the extra codes — on a narrow terminal auto-fit will pick `--grid 1` anyway. Use a wide
+terminal (200+ columns) to get the most from `--grid 2`.
+
+### Dwell time
+
+`--dwell` is how long each frame is held, in ms. The default **300 ms** is the safe floor
+for phones that record at 30 fps (it guarantees ≥3 camera frames plus time for the
+auto-focus/exposure to lock). Lower it (e.g. `--dwell 150`) only if you know your phone
+records at 60/120 fps and you've verified it still decodes — lower dwell = faster but
+riskier.
+
 ## Reference
 
 ### Flags
@@ -216,11 +262,14 @@ go test ./...
 | `--client [path]` | Read payload from `path` (file or directory) or stdin, display QR stream |
 | `--client --dry-run` | Show symbol count + time estimate, display nothing |
 | `--client --redundancy N` | RaptorQ redundancy as % of base symbols (default 50) |
+| `--client --symbol-size N` | Raw bytes per QR symbol (0 = auto-fit to the terminal, the default) |
+| `--client --grid N` | QR codes shown side by side per frame (default 1; 2 needs a wide terminal) |
+| `--client --dwell N` | ms each frame is held (default 300, 30fps-safe) |
 | `--client --key PASSPHRASE` | Encrypt the payload with AES-256-GCM |
 | `--client --job NAME` | Job name (matches the server job for multi-video assembly) |
 | `--client --start N` | First symbol to display (1-based), to split a transfer across videos |
 | `--client --count N` | Number of symbols to display (0 = to the end) |
-| `--client --no-quiet-zone` | Omit the QR quiet zone to save 8 columns (narrow terminals) |
+| `--client --no-quiet-zone` | Omit the QR quiet zone to fit a bigger QR in a narrow terminal |
 | `--client --no-warmup` | Skip the warm-up focus/exposure pattern |
 | `--server` | Web server on port 9999: upload video, reconstruct payload |
 | `--server --token SECRET` | Require the shared token on upload/download |
@@ -245,23 +294,25 @@ go test ./...
 Each QR code encodes `GQ3:<mode>:<blobLen>:<symbolID>:<base64(symbol)>` where `<mode>` is
 `z` (zstd-compressed) or `ze` (zstd-compressed then AES-GCM encrypted), `<blobLen>` is the
 exact byte length of that blob (the RaptorQ decoder needs it), `<symbolID>` indexes the
-fountain symbol, and `<base64(symbol)>` is a ~240-byte RaptorQ symbol. The `:` separators
-cannot appear in base64, so framing is unambiguous.
+fountain symbol, and `<base64(symbol)>` is the base64 of one RaptorQ symbol (its size is
+set by `--symbol-size`, auto-fitted to the terminal by default). The `:` separators cannot
+appear in base64, so framing is unambiguous.
 
 ## Throughput
 
-Each QR carries a 240-byte symbol held for 550 ms, and 50% redundancy means you emit 1.5
-symbols per base symbol. RaptorQ pads the symbol count, so treat these as **approximate
-worst-case** (incompressible data) figures — run `--dry-run` for the exact count and time
-for your payload:
+Throughput depends on your terminal, because the symbol size auto-fits it. Each frame is
+held for the dwell time (default 300 ms), and 50% redundancy means you emit 1.5 symbols per
+base symbol. RaptorQ pads the symbol count, so treat these as **approximate worst-case**
+(incompressible data) figures — run `--dry-run` for the exact count and time for your
+payload and terminal:
 
-| Original size | Total symbols (approx) | Recording time (approx) |
-| --- | --- | --- |
-| 1 KB | ~9 | ~5 s |
-| 10 KB | ~77 | ~42 s |
-| 100 KB | ~770 | ~7 min |
-| 1 MB | ~7,900 | ~70 min |
-| 10 MB | ~79,000 | ~12 h |
+| Terminal (auto-fit) | Bytes/frame | 1 KB | 100 KB | 1 MB |
+| --- | --- | --- | --- | --- |
+| 80×24 (cmd.exe / Terminal.app) | 9 | ~50 s | ~9 h | ~75 h |
+| 120×30 (Windows Terminal) | 33 | ~14 s | ~23 min | ~3.9 h |
+| 120×40 | 99 | ~5 s | ~8 min | ~78 min |
+| 200×50 | 195 | ~2 s | ~4 min | ~40 min |
+| 200×50, `--grid 2` | 390 | ~1 s | ~2 min | ~20 min |
 
 Compressible payloads (text, PDFs, source) shrink under zstd and transfer proportionally
 faster. Lower `--redundancy` shortens the video at the cost of less tolerance for a bad
@@ -271,9 +322,12 @@ recording.
 
 Constants at the top of `goqrexfil.go`:
 
-* `symbolSize` — bytes per RaptorQ symbol (240 → ~320 base64 chars per QR). Changing it
-  alters QR density; run `--selftest` after changing it.
-* `msBetweenFrames` — dwell time per symbol (550 ms). Raise it if your phone drops frames.
+* `defaultDwell` — default dwell time per frame (300 ms, 30fps-safe). Override with
+  `--dwell`.
+* `defaultGrid` — default QR codes per frame (1). Override with `--grid`.
+* `defaultSymbolSize` — fallback symbol size when the terminal can't be detected
+  (120 B). Normally auto-fit overrides this; override with `--symbol-size`.
+* `gridGap` — modules of gap between grid cells (2, on top of the quiet zones).
 * `ffmpegImageScale` — frames are extracted at native resolution, capped at 1600 px wide
   for 4K video. Never downscale below ~600 px: QR recognition fails below that.
 
