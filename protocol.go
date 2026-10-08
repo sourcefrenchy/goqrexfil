@@ -11,16 +11,22 @@ import (
 
 const (
 	protocolPrefix = "GQ3:" // GQ3:<mode>:<blobLen>:<symbolID>:<base64(symbol)>
-	symbolSize     = 240    // raw bytes per RaptorQ symbol -> ~320 base64 chars per QR
 
 	modeCompressed = "z"  // blob is zstd-compressed
 	modeEncrypted  = "ze" // blob is zstd-compressed then AES-GCM encrypted
 )
 
+// defaultSymbolSize is the raw bytes per RaptorQ symbol when --symbol-size is not
+// given. 120 -> a version-13 QR (69 modules, ~77 cols x 39 rows with quiet zone),
+// which fits a standard 120x40 terminal without clipping and stays within the
+// reliable-scanning ceiling for phones reading QRs off a screen.
+const defaultSymbolSize = 120
+
 // encodePayload compresses (and optionally encrypts) the payload and turns it into
-// a stream of RaptorQ symbols, each framed for a QR code. It returns the framed
-// QR payloads (in symbol-id order), k (the number of base symbols), and the mode.
-func encodePayload(payload []byte, redundancyPct int, key string) ([]string, int, string, error) {
+// a stream of RaptorQ symbols, each framed for a QR code. symbolSize is the raw
+// bytes per symbol. It returns the framed QR payloads (in symbol-id order), k (the
+// number of base symbols), and the mode.
+func encodePayload(payload []byte, redundancyPct, symbolSize int, key string) ([]string, int, string, error) {
 	compressed, err := zstdCompress(payload)
 	if err != nil {
 		return nil, 0, "", err
@@ -35,7 +41,7 @@ func encodePayload(payload []byte, redundancyPct int, key string) ([]string, int
 		mode = modeEncrypted
 	}
 
-	rq := raptorq.NewRaptorQ(symbolSize)
+	rq := raptorq.NewRaptorQ(uint32(symbolSize))
 	enc, err := rq.CreateEncoder(blob)
 	if err != nil {
 		return nil, 0, "", err
