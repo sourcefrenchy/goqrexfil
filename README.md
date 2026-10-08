@@ -373,6 +373,23 @@ Constants at the top of `goqrexfil.go`:
 * `ffmpegImageScale` — frames are extracted at native resolution, capped at 1600 px wide
   for 4K video. Never downscale below ~600 px: QR recognition fails below that.
 
+## Roadmap
+
+Ideas for future work, roughly in priority order:
+
+* **Windows UTF-8 auto-setup** — detect Windows and switch the console to the UTF-8 code page
+  (`chcp 65001`) automatically, so the half-block glyphs render correctly in cmd.exe without
+  manual setup.
+* **Non-terminal renderer** — a local loopback HTML display (or an image written to a file)
+  for machines where the terminal font or window size is the bottleneck, bypassing the 80×24
+  wall entirely.
+* **Multiple payloads per job** — send several files in one transfer (a manifest of files
+  rather than a single blob), reusing the existing job assembly.
+* **Adaptive redundancy** — automatically raise the RaptorQ pool when the server reports a
+  high loss rate across a multi-video job, instead of a fixed `--redundancy`.
+* **Config file / env vars** — remember common settings (job name, redundancy, key, dwell)
+  for repeated use without retyping flags.
+
 ## Limitations
 
 * The server is plain HTTP by default with no authentication — use `--token` and/or `--tls`
@@ -382,6 +399,12 @@ Constants at the top of `goqrexfil.go`:
   recording may still need a re-take.
 * This is a research/education project about cover channels. Use it only on systems you own
   or are authorized to test.
+
+---
+
+<p align="center">
+  <img src="docs/logo.png" width="72" alt="goqrexfil logo"/>
+</p>
 
 ## License
 
