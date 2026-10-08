@@ -113,6 +113,8 @@ github.com/ugorji/go/codec v1.2.11 h1:BMaWp1Bb6fHwEtbplGBGJ498wD+LKlNSl25MjdZY4d
 github.com/ugorji/go/codec v1.2.11/go.mod h1:UNopzCgEMSXjBc6AOMqYvWC1ktqTAfzJZUZgYf6w6lg=
 github.com/ugorji/go/codec v1.3.1 h1:waO7eEiFDwidsBN6agj1vJQ4AG7lh2yqXyOXqhgQuyY=
 github.com/ugorji/go/codec v1.3.1/go.mod h1:pRBVtBSKl77K30Bv8R2P+cLSGaTtex6fsA2Wjqmfxj4=
+github.com/xssnick/raptorq v1.6.0 h1:L9DMwfdyBasLWBI4rIWmJGIpvVhA6Syx7/B4LugONy0=
+github.com/xssnick/raptorq v1.6.0/go.mod h1:mo5n6T4yaqZkNVMWonRuMS0tcyD4XQ6PwwTjaY3ZwQY=
 github.com/zserge/lorca v0.1.10 h1:f/xBJ3D3ipcVRCcvN8XqZnpoKcOXV8I4vwqlFyw7ruc=
 github.com/zserge/lorca v0.1.10/go.mod h1:bVmnIbIRlOcoV285KIRSe4bUABKi7R7384Ycuum6e4A=
 go.mongodb.org/mongo-driver/v2 v2.5.0 h1:yXUhImUjjAInNcpTcAlPHiT7bIXhshCTL3jVBkF3xaE=

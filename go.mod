@@ -8,7 +8,7 @@ require (
 	github.com/kjk/smaz v0.0.0-20151202183815-c61c680e82ff
 	github.com/liyue201/goqr v0.0.0-20200803022322-df443203d4ea
 	github.com/sirupsen/logrus v1.10.2
-	github.com/zserge/lorca v0.1.10
+	github.com/xssnick/raptorq v1.6.0
 	golang.org/x/crypto v0.57.0
 )
 
